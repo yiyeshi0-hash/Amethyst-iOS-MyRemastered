@@ -1,3 +1,38 @@
+# Air-Metal (Amethyst iOS Remastered + Metal Universal)
+
+**本 fork 基于官方 [Amethyst-iOS-MyRemastered](https://github.com/herbrine8403/Amethyst-iOS-MyRemastered) `48a0202`,集成 Metal Universal 原生 Metal 渲染,vanilla / Fabric / Forge 三种形态开箱即用。**
+
+## 改版内容
+
+1. **启动器渲染器新增 "Metal (metallum)" 选项**(设置 → 游戏设置 → 渲染器)
+   - `Natives/utils.h` / `Natives/LauncherPreferences.m`: 渲染器列表加 Metal
+   - `Natives/JavaLauncher.m`: 选 Metal 时设 `AMETHYST_METAL=1`,EGL 渲染器回落 auto 提供 surface
+2. **Metallum agent 注入(`-javaagent:metallum_agent.jar`)**
+   - premain 提前加载完整版 libspvc + `ensureSpvcLibraryConfigured`(防止 MoltenVK 阉割版符号 → -4)
+   - ASM 注入 `PreferredGraphicsApi.getBackendsToTry` → 返回 `[Metal, Vulkan, GL]`
+   - Fabric/Quilt 实例自动跳过(交给内置 mod,避免 ASM classpath 冲突);agent 内 ASM 已 relocate 为 `com.metallum.asm`
+   - Forge 兼容: `ForgeLoadingOverlay.<init>` 注入(GOTO 跳过 logo 纹理强转)
+3. **内置 MetalUniversal mod(开箱即用)**
+   - `mods_preload/MetalUniversal-1.0.4.jar` 首次启动自动拷入实例 `mods/`
+   - Fabric/Quilt 实例自动生效(vanilla 不加载,无害)
+4. **Forge 模块冲突修复**: `com.apple.ios.audio` 从 `libs/lwjgl.jar` 移除(仅保留在 `launcher.jar`),修复 Forge 26.2 JPMS 双模块导出 `ResolutionException`
+
+## 使用
+
+- 安装后: 启动器 → 游戏设置 → 渲染器 → **Metal (metallum)**
+- JIT: StikDebug 附加 + 调试设置两个开关(Use Universal StikDebug Script / Keep attached to StikDebug)
+- 实测(iPhone 17 Pro / A19 Pro / iOS 27.0): 32 区块 105+ 帧
+- 详细说明见 `METAL_TUTORIAL.txt`
+
+## 构建
+
+```bash
+# 研究机(Xcode 26.3): pip 装 cmake + gmake 软链 + BOOTJDK=JDK8, 然后
+cd Natives && cmake .. && make
+```
+
+---
+
 <div align="center">
   <img src="Natives/Assets.xcassets/AppIcon-Light.appiconset/1024x1024.png" alt="Air Icon" width="120" style="border-radius: 24px;">
 </div>
