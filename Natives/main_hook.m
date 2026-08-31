@@ -1,0 +1,1140 @@
+#import <Foundation/Foundation.h>
+#import "PLLogOutputView.h"
+#import "SurfaceViewController.h"
+#import "ios_uikit_bridge.h"
+#import "utils.h"
+#import "mach_excServer.h"
+
+#include <dlfcn.h>
+#include <libgen.h>
+#include <pthread.h>
+#include "external/fishhook/fishhook.h"
+
+// 硬件断点异常端口（同步自上游，用于非 TXM 的 iOS 26+ 设备 dlopen 重定向）
+mach_port_t excPort;
+void *hooked_dlopen_26_ppl(const char *path, int mode);
+
+void (*orig_abort)();
+void (*orig_exit)(int code);
+void* (*orig_dlopen)(const char* path, int mode);
+void* (*orig_dlsym)(void* handle, const char* name);
+int (*orig_open)(const char *path, int oflag, ...);
+
+/// 提供给 zink stride fix 使用的"绕过 hook"的 dlsym
+/// amethyst_vkGetInstanceProcAddr / amethyst_vkGetDeviceProcAddr 内部查找
+/// 真实 Vulkan 函数指针时必须调用此函数，否则会被 hooked_dlsym 拦截（返回
+/// 我们的 wrapper），导致无限递归。
+void *amethyst_orig_dlsym(void *handle, const char *name) {
+    if (orig_dlsym) {
+        return orig_dlsym(handle, name);
+    }
+    // fallback：如果 hook 尚未初始化（不应发生），用普通 dlsym
+    return dlsym(handle, name);
+}
+
+// 前向声明：zink stride fix 状态变量（定义在文件后部 Vulkan stride fix 区域，
+// 但 hooked_dlopen 在文件前部就需要引用它来检测 libOSMesa 加载）
+static BOOL g_zinkStrideFixActive = NO;
+
+void handle_fatal_exit(int code) {
+    if (NSThread.isMainThread) {
+        return;
+    }
+
+    // 注意：本仓库 PLLogOutputView.handleExitCode: 返回 void（项目自定义的
+    // PLCrashView 集成），不能照搬上游的 if (![PLLogOutputView handleExitCode:code]) return;
+    // 检查。这里直接调用，让 PLCrashView 内部决定是否展示崩溃界面。
+    [PLLogOutputView handleExitCode:code];
+
+    if (fatalExitGroup != nil) {
+        // Likely other threads are crashing, put them to sleep
+        sleep(INT_MAX);
+    }
+    fatalExitGroup = dispatch_group_create();
+    dispatch_group_enter(fatalExitGroup);
+    dispatch_group_wait(fatalExitGroup, DISPATCH_TIME_FOREVER);
+}
+
+void hooked_abort() {
+    NSLog(@"abort() called");
+    handle_fatal_exit(SIGABRT);
+    orig_abort();
+}
+
+void hooked___assert_rtn(const char* func, const char* file, int line, const char* failedexpr)
+{
+    if (func == NULL) {
+        fprintf(stderr, "Assertion failed: (%s), file %s, line %d.\n", failedexpr, file, line);
+    } else {
+        fprintf(stderr, "Assertion failed: (%s), function %s, file %s, line %d.\n", failedexpr, func, file, line);
+    }
+    hooked_abort();
+}
+
+void hooked_exit(int code) {
+    NSLog(@"exit(%d) called", code);
+    if (code == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIApplication.sharedApplication performSelector:@selector(suspend)];
+        });
+        usleep(100*1000);
+        orig_exit(0);
+        return;
+    }
+    handle_fatal_exit(code);
+
+    orig_exit(code);
+}
+
+void* hooked_dlopen(const char* path, int mode) {
+    // 同步自上游：非 TXM 的 iOS 26+ 设备需要硬件断点重定向（hooked_dlopen_26_ppl）
+    BOOL shouldUseDyldBypass26PPL = NO;
+    if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED)) {
+        shouldUseDyldBypass26PPL = hwRedirectOrig[0] && !DeviceHasJITFlags(JIT_FLAG_HAS_TXM);
+    }
+    // Only patch Mach-O and use dyld bypass dylib is in the home dir
+    // or tmp dir: LiveContainer makes a symlink to its own tmp dir so checking home dir alone would fail
+    const char *home = getenv("HOME");
+    const char *tmp = getenv("TMPDIR");
+    char fullpath[PATH_MAX];
+    BOOL shouldUseDyldBypass = path && realpath(path, fullpath) && (strstr(fullpath, home) || (tmp && strstr(fullpath, tmp)));
+    shouldUseDyldBypass26PPL &= shouldUseDyldBypass;
+
+    // 同步自上游：在分支前统一调用 PLPatchMachOPlatformForFile
+    // （原实现仅在 shouldUseDyldBypass 分支调用，遗漏了 26PPL 路径，
+    //  会导致 iOS 26+ 非 TXM 设备的 dyld bypass 失败）
+    if (shouldUseDyldBypass) {
+        PLPatchMachOPlatformForFile(path);
+    }
+
+    // fork 自有特性：Zink stride fix——libOSMesa 加载后重新执行 fishhook，
+    // 捕获其对 vkGetInstanceProcAddr / vkGetDeviceProcAddr 的符号引用
+    // （installZinkStrideFix 在 libOSMesa 加载前调用，初次 rebind 无法
+    //  捕获 libOSMesa image 内的引用；必须在其加载后再次 rebind）
+    BOOL needsZinkRebind = path && strstr(path, "libOSMesa") && g_zinkStrideFixActive;
+
+    void *handle;
+    if (shouldUseDyldBypass26PPL) {
+        if (needsZinkRebind) {
+            handle = hooked_dlopen_26_ppl(path, mode);
+        } else {
+            __attribute__((musttail)) return hooked_dlopen_26_ppl(path, mode);
+        }
+    } else if (shouldUseDyldBypass) {
+        // Special case for LiveContainer multitask mode where it hooks dlopen to hook mmap,
+        // which will break this dyld bypass, so we redirect calls to the original dlopen.
+        static void *(*sys_dlopen)(const char *, int);
+        if(!sys_dlopen) sys_dlopen = dlsym(RTLD_NEXT, "dlopen");
+        if (needsZinkRebind) {
+            handle = sys_dlopen(path, mode);
+        } else {
+            __attribute__((musttail)) return sys_dlopen(path, mode);
+        }
+    } else {
+        if (needsZinkRebind) {
+            handle = orig_dlopen(path, mode);
+        } else {
+            __attribute__((musttail)) return orig_dlopen(path, mode);
+        }
+    }
+
+    // Zink stride fix rebind（仅在 needsZinkRebind 时执行）
+    if (handle && needsZinkRebind) {
+        NSLog(@"[ZinkStrideFix] libOSMesa loaded via dlopen, re-rebinding Vulkan symbols");
+        rebindZinkStrideFixForNewImage();
+    }
+    return handle;
+}
+
+// ============================================================================
+// 硬件断点 dlopen 重定向（同步自上游，用于非 TXM 的 iOS 26+ 设备）
+// 当 redirectFunctionHWBreakpoint 被选中时，dlopen 需要通过硬件断点 + Mach 异常
+// 来重定向 dyld 内的 mmap/fcntl 调用，因为此时无法直接修改 dyld 代码段。
+// ============================================================================
+void *exception_handler(void *unused) {
+    mach_msg_server(mach_exc_server, sizeof(union __RequestUnion__catch_mach_exc_subsystem), excPort, MACH_MSG_OPTION_NONE);
+    abort();
+}
+
+void *hooked_dlopen_26_ppl(const char *path, int mode) {
+    if (!excPort) {
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
+        mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND);
+        pthread_t thread;
+        pthread_create(&thread, NULL, exception_handler, NULL);
+    }
+
+    // save old thread states
+    exception_mask_t mask = EXC_MASK_BREAKPOINT;
+    mach_msg_type_number_t masksCnt = 1;
+    exception_handler_t handler = excPort;
+    exception_behavior_t behavior = EXCEPTION_STATE | MACH_EXCEPTION_CODES;
+    thread_state_flavor_t flavor = ARM_THREAD_STATE64;
+    arm_debug_state64_t origDebugState;
+    mach_port_t thread = mach_thread_self();
+    thread_get_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origDebugState, &(mach_msg_type_number_t){ARM_DEBUG_STATE64_COUNT});
+    thread_swap_exception_ports(thread, mask, handler, behavior, flavor, &mask, &masksCnt, &handler, &behavior, &flavor);
+    if (masksCnt != 1) {
+        NSLog(@"main_hook: Expected 1 exception port, got %d. HW breakpoint hook may fail.", masksCnt);
+    }
+
+    // hook stuff. this will overwrite LiveContainer private container multitask's hook, we will load __TEXT using JIT inside
+    arm_debug_state64_t hookDebugState = {0};
+    for(int i = 0; i < 6 && hwRedirectOrig[i]; i++) {
+        hookDebugState.__bvr[i] = (uint64_t)hwRedirectOrig[i];
+        hookDebugState.__bcr[i] = 0x1e5;
+    }
+    thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&hookDebugState, ARM_DEBUG_STATE64_COUNT);
+
+    // fixup @loader_path since we cannot use musttail here
+    void *result;
+    void *callerAddr = __builtin_return_address(0);
+    struct dl_info info;
+    if (path && !strncmp(path, "@loader_path/", 13) && dladdr(callerAddr, &info)) {
+        char resolvedPath[PATH_MAX];
+        snprintf(resolvedPath, sizeof(resolvedPath), "%s/%s", dirname((char *)info.dli_fname), path + 13);
+        result = orig_dlopen(resolvedPath, mode);
+    } else {
+        result = orig_dlopen(path, mode);
+    }
+
+    // restore old thread states
+    thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origDebugState, ARM_DEBUG_STATE64_COUNT);
+    thread_swap_exception_ports(thread, mask, handler, behavior, flavor, &mask, &masksCnt, &handler, &behavior, &flavor);
+
+    return result;
+}
+
+kern_return_t catch_mach_exception_raise_state(mach_port_t exception_port, exception_type_t exception, const mach_exception_data_t code, mach_msg_type_number_t codeCnt, int *flavor, const thread_state_t old_state, mach_msg_type_number_t old_stateCnt, thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
+    arm_thread_state64_t *old = (arm_thread_state64_t *)old_state;
+    arm_thread_state64_t *new = (arm_thread_state64_t *)new_state;
+    uint64_t pc = arm_thread_state64_get_pc(*old);
+
+    for(int i = 0; i < 6 && hwRedirectOrig[i]; i++) {
+        if(pc == (uint64_t)hwRedirectOrig[i]) {
+            *new = *old;
+            *new_stateCnt = old_stateCnt;
+            arm_thread_state64_set_pc_fptr(*new, hwRedirectTarget[i]);
+            return KERN_SUCCESS;
+        }
+    }
+    NSLog(@"[DyldLVBypass] Unknown breakpoint at pc: %p", (void*)pc);
+    return KERN_FAILURE;
+}
+
+kern_return_t catch_mach_exception_raise(mach_port_t exception_port, mach_port_t thread, mach_port_t task, exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t codeCnt) {
+    abort();
+}
+
+kern_return_t catch_mach_exception_raise_state_identity(mach_port_t exception_port, mach_port_t thread, mach_port_t task, exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t codeCnt, int *flavor, thread_state_t old_state, mach_msg_type_number_t old_stateCnt, thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
+    abort();
+}
+
+// ============================================================================
+// Vulkan vertex stride alignment fix（zink + MoltenVK + Mesa 25.0.7）
+// ============================================================================
+// 问题：
+//   Metal API 硬性要求 vertex attribute binding stride 必须 4 字节对齐。
+//   Mesa 25.0.7 zink 移除了 Mesa 21.0.0 中存在的 stride 对齐 workaround。
+//   当光影包（如 BSL）触发管线重建且 stride 非 4 对齐时，MoltenVK 返回
+//   VK_ERROR_INITIALIZATION_FAILED，zink 的 update_gfx_pipeline 未处理该
+//   错误，使用 NULL pipeline 句柄导致 SIGSEGV。
+//
+// 解决方案：
+//   通过 dlsym 拦截 + fishhook 双重机制 hook vkGetInstanceProcAddr /
+//   vkGetDeviceProcAddr。当 zink 请求 vkCreateGraphicsPipelines 时返回
+//   我们的 wrapper。wrapper 在调用真实函数前将 vertex binding stride
+//   向上对齐到 4 字节边界。
+//
+//   此 fix 仅在 zink 渲染器（libOSMesa）被选中时激活。
+
+// 最小 Vulkan 类型定义（布局严格匹配 vulkan_core.h，64 位平台）
+typedef int32_t VkZResult;
+typedef struct VkZInstance_T* VkZInstance;
+typedef struct VkZDevice_T* VkZDevice;
+typedef struct VkZCommandBuffer_T* VkZCommandBuffer;
+typedef struct VkZPipelineCache_T* VkZPipelineCache;
+typedef struct VkZPipeline_T* VkZPipeline;
+typedef struct VkZPipelineLayout_T* VkZPipelineLayout;
+typedef struct VkZRenderPass_T* VkZRenderPass;
+
+#define VK_Z_SUCCESS 0
+#define VK_Z_ERROR_INITIALIZATION_FAILED (-3)
+
+// VkPipelineBindPoint
+typedef enum {
+    VK_Z_PIPELINE_BIND_POINT_GRAPHICS = 0,
+    VK_Z_PIPELINE_BIND_POINT_COMPUTE = 1,
+} VkZPipelineBindPoint;
+
+typedef enum {
+    VK_Z_VERTEX_INPUT_RATE_VERTEX = 0,
+    VK_Z_VERTEX_INPUT_RATE_INSTANCE = 1,
+} VkZVertexInputRate;
+
+typedef struct {
+    uint32_t binding;
+    uint32_t stride;
+    VkZVertexInputRate inputRate;
+} VkZVertexInputBindingDescription;
+
+typedef struct {
+    uint32_t location;
+    uint32_t binding;
+    int32_t format;
+    uint32_t offset;
+} VkZVertexInputAttributeDescription;
+
+typedef struct {
+    int32_t sType;                   // VkStructureType
+    const void* pNext;
+    uint32_t flags;
+    uint32_t vertexBindingDescriptionCount;
+    const VkZVertexInputBindingDescription* pVertexBindingDescriptions;
+    uint32_t vertexAttributeDescriptionCount;
+    const VkZVertexInputAttributeDescription* pVertexAttributeDescriptions;
+} VkZPipelineVertexInputStateCreateInfo;
+
+// VkGraphicsPipelineCreateInfo 完整布局（匹配 vulkan_core.h，64 位）
+typedef struct {
+    int32_t sType;                   // VkStructureType
+    const void* pNext;
+    uint32_t flags;
+    uint32_t stageCount;
+    const void* pStages;             // const VkPipelineShaderStageCreateInfo*
+    const VkZPipelineVertexInputStateCreateInfo* pVertexInputState;
+    const void* pInputAssemblyState;
+    const void* pTessellationState;
+    const void* pViewportState;
+    const void* pRasterizationState;
+    const void* pMultisampleState;
+    const void* pDepthStencilState;
+    const void* pColorBlendState;
+    const void* pDynamicState;
+    VkZPipelineLayout layout;
+    VkZRenderPass renderPass;
+    uint32_t subpass;
+    VkZPipeline basePipelineHandle;
+    int32_t basePipelineIndex;
+} VkZGraphicsPipelineCreateInfo;
+
+typedef VkZResult (*PFN_zkCreateGraphicsPipelines)(
+    VkZDevice, VkZPipelineCache, uint32_t,
+    const VkZGraphicsPipelineCreateInfo*, const void*, VkZPipeline*);
+typedef void* (*PFN_zkGetInstanceProcAddr)(VkZInstance, const char*);
+typedef void* (*PFN_zkGetDeviceProcAddr)(VkZDevice, const char*);
+
+// vkCmd* 函数指针类型（用于 dummy pipeline skip draws）
+// 参数数量严格匹配 Vulkan 标准签名（vulkan_core.h），避免与函数实现调用不一致
+typedef void (*PFN_zkCmdBindPipeline)(VkZCommandBuffer, VkZPipelineBindPoint, VkZPipeline);
+typedef void (*PFN_zkCmdDraw)(VkZCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+typedef void (*PFN_zkCmdDrawIndexed)(VkZCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
+// vkCmdDrawIndirect(cmd, buffer, offset, drawCount, stride) — 5 个参数
+typedef void (*PFN_zkCmdDrawIndirect)(VkZCommandBuffer, uint64_t, uint64_t, uint32_t, uint32_t);
+typedef void (*PFN_zkCmdDrawIndexedIndirect)(VkZCommandBuffer, uint64_t, uint64_t, uint32_t, uint32_t);
+// vkCmdDrawIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride) — 7 个参数
+typedef void (*PFN_zkCmdDrawIndirectCount)(VkZCommandBuffer, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t);
+typedef void (*PFN_zkCmdDrawIndexedIndirectCount)(VkZCommandBuffer, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t);
+// vkDestroyPipeline(device, pipeline, pAllocator) — 3 个参数
+// 必须 hook：zink 销毁 dummy pipeline 时，MoltenVK 解引用 magic handle 会崩溃
+typedef void (*PFN_zkDestroyPipeline)(VkZDevice, VkZPipeline, const void*);
+
+// Stride fix 状态（g_zinkStrideFixActive 已在文件前部前向声明）
+static PFN_zkGetInstanceProcAddr g_real_vkGetInstanceProcAddr = NULL;
+static PFN_zkGetDeviceProcAddr g_real_vkGetDeviceProcAddr = NULL;
+static PFN_zkCreateGraphicsPipelines g_real_vkCreateGraphicsPipelines = NULL;
+
+// vkCmd* 真实函数指针（dummy pipeline skip draws 需要）
+static PFN_zkCmdBindPipeline g_real_vkCmdBindPipeline = NULL;
+static PFN_zkCmdDraw g_real_vkCmdDraw = NULL;
+static PFN_zkCmdDrawIndexed g_real_vkCmdDrawIndexed = NULL;
+static PFN_zkCmdDrawIndirect g_real_vkCmdDrawIndirect = NULL;
+static PFN_zkCmdDrawIndexedIndirect g_real_vkCmdDrawIndexedIndirect = NULL;
+static PFN_zkCmdDrawIndirectCount g_real_vkCmdDrawIndirectCount = NULL;
+static PFN_zkCmdDrawIndexedIndirectCount g_real_vkCmdDrawIndexedIndirectCount = NULL;
+// vkDestroyPipeline 真实函数指针（dummy pipeline 销毁需要）
+static PFN_zkDestroyPipeline g_real_vkDestroyPipeline = NULL;
+
+// ============================================================================
+// Dummy pipeline 机制（修复 zink + Mesa 25.0.7 光影 SIGSEGV）
+// ============================================================================
+// 问题：
+//   Mesa 25.0.7 zink 比 21.0.0 更严格地校验 SPIR-V shader 接口。
+//   当光影包（如 BSL、Mellow Shader）的 fragment shader 声明了 vertex shader
+//   未写入的 input（如 user(locn1_2)），MoltenVK 在 vkCreateGraphicsPipelines
+//   时返回 VK_ERROR_INITIALIZATION_FAILED。
+//
+//   zink 的 update_gfx_pipeline 未正确处理此失败：
+//   Vulkan spec 规定 vkCreateGraphicsPipelines 失败时 pPipelines[i] 设为
+//   VK_NULL_HANDLE，zink 后续使用 NULL pipeline 句柄导致 SIGSEGV。
+//
+// 解决方案（dummy pipeline + skip draws）：
+//   1. 当 vkCreateGraphicsPipelines 失败时，不返回失败，而是返回 VK_SUCCESS
+//      并为每个失败的 pipeline 分配一个 dummy 句柄（非 NULL 的 magic 值）。
+//   2. 维护 dummy pipeline 集合。
+//   3. Hook vkCmdBindPipeline：跟踪当前绑定的 pipeline，如果是 dummy 则跳过绑定。
+//   4. Hook vkCmdDraw*：如果当前绑定的 pipeline 是 dummy，跳过绘制。
+//
+//   这样 zink 认为 pipeline 创建成功，不会 SIGSEGV；
+//   失败的 pipeline 对应的几何体不会被绘制（黑屏/缺失，但不崩溃）。
+//   成功的 pipeline 正常渲染，光影效果保留。
+
+#define ZINK_DUMMY_PIPELINE_MAGIC 0xDEAD0000ULL
+#define ZINK_DUMMY_PIPELINE_MAX 4096
+
+// dummy pipeline 集合（使用简单数组，线性查找；dummy pipeline 数量通常很少）
+static uintptr_t g_dummyPipelines[ZINK_DUMMY_PIPELINE_MAX];
+static uint32_t g_dummyPipelineCount = 0;
+// 当前绑定的 graphics pipeline（用于判断 draw 是否应该跳过）
+// 注意：VkCommandBuffer 可能多个，但 zink 单线程渲染，用全局变量足够
+static VkZPipeline g_currentBoundGraphicsPipeline = NULL;
+
+/// 判断 pipeline 是否为 dummy
+static BOOL isDummyPipeline(VkZPipeline pipeline) {
+    if (!pipeline) return NO;
+    uintptr_t val = (uintptr_t)pipeline;
+    if ((val & 0xFFFF0000ULL) != ZINK_DUMMY_PIPELINE_MAGIC) return NO;
+    // 二分查找或线性查找（dummy pipeline 数量通常 <100，线性查找足够）
+    for (uint32_t i = 0; i < g_dummyPipelineCount; i++) {
+        if (g_dummyPipelines[i] == val) return YES;
+    }
+    return NO;
+}
+
+/// 分配一个新的 dummy pipeline 句柄
+static VkZPipeline allocDummyPipeline(void) {
+    if (g_dummyPipelineCount >= ZINK_DUMMY_PIPELINE_MAX) {
+        // 溢出：复用第一个（极端情况，几乎不会发生）
+        NSLog(@"[ZinkStrideFix] WARNING: dummy pipeline pool exhausted, reusing slot 0");
+        return (VkZPipeline)g_dummyPipelines[0];
+    }
+    uintptr_t handle = ZINK_DUMMY_PIPELINE_MAGIC | (g_dummyPipelineCount + 1);
+    g_dummyPipelines[g_dummyPipelineCount++] = handle;
+    return (VkZPipeline)handle;
+}
+
+// 前向声明（供 zinkStrideFixRebind 使用）
+static void* amethyst_vkGetInstanceProcAddr(VkZInstance instance, const char* pName);
+static void* amethyst_vkGetDeviceProcAddr(VkZDevice device, const char* pName);
+static VkZResult amethyst_vkCreateGraphicsPipelines(
+    VkZDevice device, VkZPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkZGraphicsPipelineCreateInfo* pCreateInfos, const void* pAllocator,
+    VkZPipeline* pPipelines);
+static void amethyst_vkCmdBindPipeline(VkZCommandBuffer cmd, VkZPipelineBindPoint bp, VkZPipeline pipeline);
+static void amethyst_vkCmdDraw(VkZCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
+static void amethyst_vkCmdDrawIndexed(VkZCommandBuffer cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
+static void amethyst_vkCmdDrawIndirect(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
+static void amethyst_vkCmdDrawIndexedIndirect(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
+static void amethyst_vkCmdDrawIndirectCount(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint64_t countBuffer, uint64_t countBufferOffset, uint32_t maxDrawCount, uint32_t stride);
+static void amethyst_vkCmdDrawIndexedIndirectCount(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint64_t countBuffer, uint64_t countBufferOffset, uint32_t maxDrawCount, uint32_t stride);
+static void amethyst_vkDestroyPipeline(VkZDevice device, VkZPipeline pipeline, const void* pAllocator);
+
+// ============================================================================
+// UINT→SINT 顶点属性格式转换（修复 MTLAttributeFormatUShort3 转换失败）
+// ============================================================================
+// 问题：
+//   MoltenVK 编译 pipeline 时，若 vertex attribute 使用 UINT 格式（如
+//   VK_FORMAT_R16G16B16_UINT → MTLAttributeFormatUShort3），但 shader 声明的
+//   input 是有符号整数类型（int/ivec3），Metal 无法自动转换格式，返回
+//   VK_ERROR_INITIALIZATION_FAILED：
+//   "Cannot convert attribute from MTLAttributeFormatUShort3 to a signed integer type."
+//
+//   此问题在 Iris 光影 + Mesa 25.0.7 zink 下频发，导致实体渲染 pipeline 创建
+//   失败，被 dummy pipeline fallback 替换后实体不渲染（黑屏/缺失）。
+//
+// 解决方案：
+//   当 pipeline 首次创建失败时，重试一次：将所有 UINT 格式的 vertex attribute
+//   转换为对应的 SINT 格式（如 R16G16B16_UINT → R16G16B16_SINT）。
+//   Metal 会以有符号方式解析字节，与 shader 期望匹配。
+//   对于大多数顶点属性（骨骼索引、坐标等），值通常很小，signed/unsigned 解析
+//   结果一致，不会引入渲染错误。
+
+/// 判断 Vulkan 格式是否为 UINT 类型
+/// Vulkan 格式枚举值参考 vulkan_core.h：
+///   R8_UINT=9, R8G8_UINT=11, R8G8B8_UINT=13, R8G8B8A8_UINT=42
+///   R16_UINT=76, R16G16_UINT=78, R16G16B16_UINT=80, R16G16B16A16_UINT=82
+///   R32_UINT=96, R32G32_UINT=98, R32G32B32_UINT=100, R32G32B32A32_UINT=102
+static BOOL isVkUIntFormat(int32_t format) {
+    switch (format) {
+        case 9:   // VK_FORMAT_R8_UINT
+        case 11:  // VK_FORMAT_R8G8_UINT
+        case 13:  // VK_FORMAT_R8G8B8_UINT
+        case 42:  // VK_FORMAT_R8G8B8A8_UINT
+        case 76:  // VK_FORMAT_R16_UINT
+        case 78:  // VK_FORMAT_R16G16_UINT
+        case 80:  // VK_FORMAT_R16G16B16_UINT
+        case 82:  // VK_FORMAT_R16G16B16A16_UINT
+        case 96:  // VK_FORMAT_R32_UINT
+        case 98:  // VK_FORMAT_R32G32_UINT
+        case 100: // VK_FORMAT_R32G32B32_UINT
+        case 102: // VK_FORMAT_R32G32B32A32_UINT
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+/// 将 UINT 格式转换为对应的 SINT 格式
+/// Vulkan 格式枚举中，UINT 和 SINT 是连续的（UINT+1 = SINT）：
+///   R8_UINT(9) → R8_SINT(10), R8G8_UINT(11) → R8G8_SINT(12), ...
+static int32_t convertVkUIntToSIntFormat(int32_t format) {
+    switch (format) {
+        case 9:   return 10;   // R8_UINT → R8_SINT
+        case 11:  return 12;   // R8G8_UINT → R8G8_SINT
+        case 13:  return 14;   // R8G8B8_UINT → R8G8B8_SINT
+        case 42:  return 43;   // R8G8B8A8_UINT → R8G8B8A8_SINT
+        case 76:  return 77;   // R16_UINT → R16_SINT
+        case 78:  return 79;   // R16G16_UINT → R16G16_SINT
+        case 80:  return 81;   // R16G16B16_UINT → R16G16B16_SINT
+        case 82:  return 83;   // R16G16B16A16_UINT → R16G16B16A16_SINT
+        case 96:  return 97;   // R32_UINT → R32_SINT
+        case 98:  return 99;   // R32G32_UINT → R32G32_SINT
+        case 100: return 101;  // R32G32B32_UINT → R32G32B32_SINT
+        case 102: return 103;  // R32G32B32A32_UINT → R32G32B32A32_SINT
+        default:  return format;
+    }
+}
+
+/// 检查 pipeline create infos 中是否存在 UINT 格式的 vertex attribute
+static BOOL pipelineCreateInfosHaveUIntFormat(
+    uint32_t createInfoCount,
+    const VkZGraphicsPipelineCreateInfo* pCreateInfos)
+{
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        const VkZPipelineVertexInputStateCreateInfo* vis = pCreateInfos[i].pVertexInputState;
+        if (!vis || !vis->pVertexAttributeDescriptions) continue;
+        for (uint32_t j = 0; j < vis->vertexAttributeDescriptionCount; j++) {
+            if (isVkUIntFormat(vis->pVertexAttributeDescriptions[j].format)) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+/// 重试 pipeline 创建：将 UINT 顶点属性格式转换为 SINT
+/// 可选地对齐 stride（用于与 stride 对齐修复组合使用）
+/// 返回真实函数的调用结果
+static VkZResult retryPipelineWithSIntFormats(
+    VkZDevice device, VkZPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkZGraphicsPipelineCreateInfo* pCreateInfos, const void* pAllocator,
+    VkZPipeline* pPipelines,
+    BOOL alsoAlignStrides)
+{
+    if (!g_real_vkCreateGraphicsPipelines) {
+        return VK_Z_ERROR_INITIALIZATION_FAILED;
+    }
+
+    // 如果没有 UINT 格式，重试无意义
+    if (!pipelineCreateInfosHaveUIntFormat(createInfoCount, pCreateInfos)) {
+        return VK_Z_ERROR_INITIALIZATION_FAILED;
+    }
+
+    NSLog(@"[ZinkStrideFix] Retrying pipeline creation with UINT→SINT format conversion%s",
+          alsoAlignStrides ? " + stride alignment" : "");
+
+    // 深拷贝并应用格式转换（可选 + stride 对齐）
+    VkZGraphicsPipelineCreateInfo* newCreateInfos = malloc(sizeof(VkZGraphicsPipelineCreateInfo) * createInfoCount);
+    VkZPipelineVertexInputStateCreateInfo* newVIS = malloc(sizeof(VkZPipelineVertexInputStateCreateInfo) * createInfoCount);
+    VkZVertexInputBindingDescription** allocedBindings = calloc(createInfoCount, sizeof(VkZVertexInputBindingDescription*));
+    VkZVertexInputAttributeDescription** allocedAttrs = calloc(createInfoCount, sizeof(VkZVertexInputAttributeDescription*));
+
+    memcpy(newCreateInfos, pCreateInfos, sizeof(VkZGraphicsPipelineCreateInfo) * createInfoCount);
+
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        const VkZPipelineVertexInputStateCreateInfo* vis = pCreateInfos[i].pVertexInputState;
+        if (!vis) continue;
+
+        newVIS[i] = *vis;
+
+        // 格式转换：UINT → SINT
+        if (vis->pVertexAttributeDescriptions && vis->vertexAttributeDescriptionCount > 0) {
+            uint32_t attrCount = vis->vertexAttributeDescriptionCount;
+            VkZVertexInputAttributeDescription* newAttrs = malloc(sizeof(VkZVertexInputAttributeDescription) * attrCount);
+            memcpy(newAttrs, vis->pVertexAttributeDescriptions, sizeof(VkZVertexInputAttributeDescription) * attrCount);
+            for (uint32_t j = 0; j < attrCount; j++) {
+                if (isVkUIntFormat(newAttrs[j].format)) {
+                    int32_t oldFmt = newAttrs[j].format;
+                    newAttrs[j].format = convertVkUIntToSIntFormat(newAttrs[j].format);
+                    NSLog(@"[ZinkStrideFix] Pipeline %u attr %u: format %d -> %d (UINT→SINT)",
+                          i, j, oldFmt, newAttrs[j].format);
+                }
+            }
+            allocedAttrs[i] = newAttrs;
+            newVIS[i].pVertexAttributeDescriptions = newAttrs;
+        }
+
+        // 可选：stride 对齐
+        if (alsoAlignStrides && vis->pVertexBindingDescriptions) {
+            BOOL pipelineNeedsAlignment = NO;
+            for (uint32_t j = 0; j < vis->vertexBindingDescriptionCount; j++) {
+                if (vis->pVertexBindingDescriptions[j].stride & 3) {
+                    pipelineNeedsAlignment = YES;
+                    break;
+                }
+            }
+            if (pipelineNeedsAlignment) {
+                uint32_t bindingCount = vis->vertexBindingDescriptionCount;
+                VkZVertexInputBindingDescription* newBindings = malloc(sizeof(VkZVertexInputBindingDescription) * bindingCount);
+                memcpy(newBindings, vis->pVertexBindingDescriptions, sizeof(VkZVertexInputBindingDescription) * bindingCount);
+                for (uint32_t j = 0; j < bindingCount; j++) {
+                    uint32_t oldStride = newBindings[j].stride;
+                    uint32_t newStride = (oldStride + 3) & ~3u;
+                    if (newStride != oldStride) {
+                        NSLog(@"[ZinkStrideFix] Pipeline %u binding %u: stride %u -> %u",
+                              i, j, oldStride, newStride);
+                        newBindings[j].stride = newStride;
+                    }
+                }
+                allocedBindings[i] = newBindings;
+                newVIS[i].pVertexBindingDescriptions = newBindings;
+            }
+        }
+
+        newCreateInfos[i].pVertexInputState = &newVIS[i];
+    }
+
+    VkZResult result = g_real_vkCreateGraphicsPipelines(device, pipelineCache, createInfoCount, newCreateInfos, pAllocator, pPipelines);
+
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        if (allocedBindings[i]) free(allocedBindings[i]);
+        if (allocedAttrs[i]) free(allocedAttrs[i]);
+    }
+    free(allocedAttrs);
+    free(allocedBindings);
+    free(newVIS);
+    free(newCreateInfos);
+
+    return result;
+}
+
+/// 仅对齐 vertex binding stride 到 4 字节（不做格式转换），调用真实函数
+/// 供 amethyst_vkCreateGraphicsPipelines 在策略 3 中使用
+static VkZResult createPipelinesWithAlignedStrides(
+    VkZDevice device, VkZPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkZGraphicsPipelineCreateInfo* pCreateInfos, const void* pAllocator,
+    VkZPipeline* pPipelines)
+{
+    if (!g_real_vkCreateGraphicsPipelines) {
+        return VK_Z_ERROR_INITIALIZATION_FAILED;
+    }
+
+    NSLog(@"[ZinkStrideFix] Aligning vertex binding strides for %u pipelines", createInfoCount);
+
+    VkZGraphicsPipelineCreateInfo* newCreateInfos = malloc(sizeof(VkZGraphicsPipelineCreateInfo) * createInfoCount);
+    VkZPipelineVertexInputStateCreateInfo* newVIS = malloc(sizeof(VkZPipelineVertexInputStateCreateInfo) * createInfoCount);
+    VkZVertexInputBindingDescription** allocedBindings = calloc(createInfoCount, sizeof(VkZVertexInputBindingDescription*));
+
+    memcpy(newCreateInfos, pCreateInfos, sizeof(VkZGraphicsPipelineCreateInfo) * createInfoCount);
+
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        const VkZPipelineVertexInputStateCreateInfo* vis = pCreateInfos[i].pVertexInputState;
+        if (!vis || !vis->pVertexBindingDescriptions) continue;
+
+        BOOL pipelineNeedsAlignment = NO;
+        for (uint32_t j = 0; j < vis->vertexBindingDescriptionCount; j++) {
+            if (vis->pVertexBindingDescriptions[j].stride & 3) {
+                pipelineNeedsAlignment = YES;
+                break;
+            }
+        }
+        if (!pipelineNeedsAlignment) continue;
+
+        uint32_t bindingCount = vis->vertexBindingDescriptionCount;
+        VkZVertexInputBindingDescription* newBindings = malloc(sizeof(VkZVertexInputBindingDescription) * bindingCount);
+        memcpy(newBindings, vis->pVertexBindingDescriptions, sizeof(VkZVertexInputBindingDescription) * bindingCount);
+        for (uint32_t j = 0; j < bindingCount; j++) {
+            uint32_t oldStride = newBindings[j].stride;
+            uint32_t newStride = (oldStride + 3) & ~3u;
+            if (newStride != oldStride) {
+                NSLog(@"[ZinkStrideFix] Pipeline %u binding %u: stride %u -> %u", i, j, oldStride, newStride);
+                newBindings[j].stride = newStride;
+            }
+        }
+        allocedBindings[i] = newBindings;
+
+        newVIS[i] = *vis;
+        newVIS[i].pVertexBindingDescriptions = newBindings;
+        newCreateInfos[i].pVertexInputState = &newVIS[i];
+    }
+
+    VkZResult result = g_real_vkCreateGraphicsPipelines(device, pipelineCache, createInfoCount, newCreateInfos, pAllocator, pPipelines);
+
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        if (allocedBindings[i]) free(allocedBindings[i]);
+    }
+    free(allocedBindings);
+    free(newVIS);
+    free(newCreateInfos);
+
+    return result;
+}
+
+/// vkCreateGraphicsPipelines wrapper：尝试多种修复策略确保 pipeline 创建成功
+///
+/// 修复策略（按顺序尝试）：
+///   1. 原始 stride 直接创建（MoltenVK 1.2.9+ 可能已支持未对齐 stride）
+///   2. UINT→SINT 格式转换 + 原始 stride（修复 MTLAttributeFormatUShort3 转换错误）
+///   3. stride 4 字节对齐（修复 Metal API 硬性要求）
+///   4. UINT→SINT 格式转换 + stride 对齐（组合修复）
+///   5. dummy pipeline fallback（避免 NULL pipeline 导致 SIGSEGV）
+///
+/// 关键修复（实体渲染错乱）：
+///   之前的实现总是先做 stride 对齐（54→56），但 vertex buffer 数据仍按原始
+///   stride 54 排列，导致 MoltenVK 按对齐 stride 56 读取数据但数据布局不匹配，
+///   造成实体渲染错乱。
+///   新实现优先尝试原始 stride，只有当 MoltenVK 拒绝未对齐 stride 时才回退到
+///   stride 对齐。这样在支持未对齐 stride 的 MoltenVK 版本上，stride 与数据
+///   布局匹配，渲染正确。
+static VkZResult amethyst_vkCreateGraphicsPipelines(
+    VkZDevice device, VkZPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkZGraphicsPipelineCreateInfo* pCreateInfos, const void* pAllocator,
+    VkZPipeline* pPipelines)
+{
+    // 首次调用时解析真实函数指针
+    if (!g_real_vkCreateGraphicsPipelines) {
+        if (g_real_vkGetDeviceProcAddr) {
+            g_real_vkCreateGraphicsPipelines = (PFN_zkCreateGraphicsPipelines)
+                g_real_vkGetDeviceProcAddr(device, "vkCreateGraphicsPipelines");
+        }
+        if (!g_real_vkCreateGraphicsPipelines && g_real_vkGetInstanceProcAddr) {
+            g_real_vkCreateGraphicsPipelines = (PFN_zkCreateGraphicsPipelines)
+                g_real_vkGetInstanceProcAddr((VkZInstance)NULL, "vkCreateGraphicsPipelines");
+        }
+        if (!g_real_vkCreateGraphicsPipelines) {
+            // 通过 amethyst_orig_dlsym 绕过 hook（虽然 hooked_dlsym 不拦截此函数名，
+            // 但保持一致性，避免未来扩展 hook 列表时引入递归）
+            g_real_vkCreateGraphicsPipelines = (PFN_zkCreateGraphicsPipelines)
+                amethyst_orig_dlsym(RTLD_DEFAULT, "vkCreateGraphicsPipelines");
+        }
+        NSLog(@"[ZinkStrideFix] real vkCreateGraphicsPipelines = %p", (void*)g_real_vkCreateGraphicsPipelines);
+    }
+
+    if (!g_real_vkCreateGraphicsPipelines) {
+        NSLog(@"[ZinkStrideFix] FATAL: real vkCreateGraphicsPipelines is NULL");
+        return VK_Z_ERROR_INITIALIZATION_FAILED;
+    }
+
+    // 预检查：是否需要 stride 对齐 / 是否有 UINT 格式
+    BOOL needsAlignment = NO;
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        const VkZPipelineVertexInputStateCreateInfo* vis = pCreateInfos[i].pVertexInputState;
+        if (!vis || !vis->pVertexBindingDescriptions) continue;
+        for (uint32_t j = 0; j < vis->vertexBindingDescriptionCount; j++) {
+            if (vis->pVertexBindingDescriptions[j].stride & 3) {
+                needsAlignment = YES;
+                break;
+            }
+        }
+        if (needsAlignment) break;
+    }
+    BOOL hasUIntFormat = pipelineCreateInfosHaveUIntFormat(createInfoCount, pCreateInfos);
+
+    // ===== 策略 1：原始 stride 直接创建 =====
+    // 优先尝试原始 stride，保持 stride 与 vertex buffer 数据布局匹配。
+    // MoltenVK 1.2.9+ 可能通过 setVertexBuffer:offset:attributeStride:atIndex:
+    // 或其他机制支持未对齐 stride。这是修复实体渲染错乱的关键。
+    {
+        VkZResult result = g_real_vkCreateGraphicsPipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+        if (result == VK_Z_SUCCESS) {
+            if (needsAlignment) {
+                NSLog(@"[ZinkStrideFix] Pipeline created with original (unaligned) stride - MoltenVK accepted");
+            }
+            return result;
+        }
+        NSLog(@"[ZinkStrideFix] Strategy 1 (original stride) failed: %d", result);
+        // 清理 pPipelines（失败时 MoltenVK 可能已部分设置）
+        for (uint32_t i = 0; i < createInfoCount; i++) pPipelines[i] = NULL;
+    }
+
+    // ===== 策略 2：UINT→SINT 格式转换 + 原始 stride =====
+    // 修复 MTLAttributeFormatUShort3 转换错误，保持原始 stride
+    if (hasUIntFormat) {
+        NSLog(@"[ZinkStrideFix] Strategy 2: UINT→SINT format conversion (original stride)");
+        VkZResult retryResult = retryPipelineWithSIntFormats(
+            device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines, NO);
+        if (retryResult == VK_Z_SUCCESS) {
+            NSLog(@"[ZinkStrideFix] Strategy 2 succeeded (UINT→SINT, original stride)");
+            return retryResult;
+        }
+        NSLog(@"[ZinkStrideFix] Strategy 2 failed: %d", retryResult);
+        for (uint32_t i = 0; i < createInfoCount; i++) pPipelines[i] = NULL;
+    }
+
+    // ===== 策略 3：stride 4 字节对齐 =====
+    // MoltenVK 拒绝未对齐 stride 时，回退到 stride 对齐。
+    // 注意：这可能导致 stride 与 vertex buffer 数据布局不匹配，引发渲染错乱。
+    // 但可以避免 pipeline 创建失败导致的 SIGSEGV。
+    NSLog(@"[ZinkStrideFix] Strategy 3: stride 4-byte alignment");
+    {
+        VkZResult result = createPipelinesWithAlignedStrides(
+            device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+        if (result == VK_Z_SUCCESS) {
+            NSLog(@"[ZinkStrideFix] Strategy 3 succeeded (stride alignment)");
+            return result;
+        }
+        NSLog(@"[ZinkStrideFix] Strategy 3 failed: %d", result);
+        for (uint32_t i = 0; i < createInfoCount; i++) pPipelines[i] = NULL;
+    }
+
+    // ===== 策略 4：UINT→SINT 格式转换 + stride 对齐 =====
+    if (hasUIntFormat) {
+        NSLog(@"[ZinkStrideFix] Strategy 4: UINT→SINT + stride alignment");
+        VkZResult retryResult = retryPipelineWithSIntFormats(
+            device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines, YES);
+        if (retryResult == VK_Z_SUCCESS) {
+            NSLog(@"[ZinkStrideFix] Strategy 4 succeeded (UINT→SINT + stride alignment)");
+            return retryResult;
+        }
+        NSLog(@"[ZinkStrideFix] Strategy 4 failed: %d", retryResult);
+        for (uint32_t i = 0; i < createInfoCount; i++) pPipelines[i] = NULL;
+    }
+
+    // ===== 策略 5：dummy pipeline fallback =====
+    // 所有修复策略都失败，分配 dummy pipeline 避免 NULL pipeline 导致 SIGSEGV。
+    // dummy pipeline 的 draw 调用会被我们的 hook 跳过（实体不渲染，但不崩溃）。
+    NSLog(@"[ZinkStrideFix] All strategies failed, applying dummy pipeline fallback");
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        if (!pPipelines[i]) {
+            pPipelines[i] = allocDummyPipeline();
+            NSLog(@"[ZinkStrideFix] Pipeline %u: allocated dummy handle %p", i, (void*)pPipelines[i]);
+        }
+    }
+    return VK_Z_SUCCESS;
+}
+
+/// vkGetInstanceProcAddr wrapper
+/// 拦截 vkGetDeviceProcAddr、vkCreateGraphicsPipelines、vkCmd* 请求，返回我们的 hook
+static void* amethyst_vkGetInstanceProcAddr(VkZInstance instance, const char* pName) {
+    if (pName) {
+        if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+            if (!g_real_vkGetDeviceProcAddr && g_real_vkGetInstanceProcAddr) {
+                g_real_vkGetDeviceProcAddr = (PFN_zkGetDeviceProcAddr)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkGetDeviceProcAddr;
+        }
+        if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) {
+            if (!g_real_vkCreateGraphicsPipelines && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCreateGraphicsPipelines = (PFN_zkCreateGraphicsPipelines)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCreateGraphicsPipelines;
+        }
+        // vkCmd* hooks（dummy pipeline skip draws）
+        if (strcmp(pName, "vkCmdBindPipeline") == 0) {
+            if (!g_real_vkCmdBindPipeline && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCmdBindPipeline = (PFN_zkCmdBindPipeline)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCmdBindPipeline;
+        }
+        if (strcmp(pName, "vkCmdDraw") == 0) {
+            if (!g_real_vkCmdDraw && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCmdDraw = (PFN_zkCmdDraw)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCmdDraw;
+        }
+        if (strcmp(pName, "vkCmdDrawIndexed") == 0) {
+            if (!g_real_vkCmdDrawIndexed && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCmdDrawIndexed = (PFN_zkCmdDrawIndexed)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndexed;
+        }
+        if (strcmp(pName, "vkCmdDrawIndirect") == 0) {
+            if (!g_real_vkCmdDrawIndirect && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCmdDrawIndirect = (PFN_zkCmdDrawIndirect)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndirect;
+        }
+        if (strcmp(pName, "vkCmdDrawIndexedIndirect") == 0) {
+            if (!g_real_vkCmdDrawIndexedIndirect && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCmdDrawIndexedIndirect = (PFN_zkCmdDrawIndexedIndirect)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndexedIndirect;
+        }
+        if (strcmp(pName, "vkCmdDrawIndirectCount") == 0) {
+            if (!g_real_vkCmdDrawIndirectCount && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCmdDrawIndirectCount = (PFN_zkCmdDrawIndirectCount)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndirectCount;
+        }
+        if (strcmp(pName, "vkCmdDrawIndexedIndirectCount") == 0) {
+            if (!g_real_vkCmdDrawIndexedIndirectCount && g_real_vkGetInstanceProcAddr) {
+                g_real_vkCmdDrawIndexedIndirectCount = (PFN_zkCmdDrawIndexedIndirectCount)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndexedIndirectCount;
+        }
+        // vkDestroyPipeline hook：dummy pipeline 销毁时跳过，避免 MoltenVK 崩溃
+        if (strcmp(pName, "vkDestroyPipeline") == 0) {
+            if (!g_real_vkDestroyPipeline && g_real_vkGetInstanceProcAddr) {
+                g_real_vkDestroyPipeline = (PFN_zkDestroyPipeline)
+                    g_real_vkGetInstanceProcAddr(instance, pName);
+            }
+            return (void*)amethyst_vkDestroyPipeline;
+        }
+    }
+    if (!g_real_vkGetInstanceProcAddr) {
+        // 关键：必须用 amethyst_orig_dlsym 绕过 hooked_dlsym，否则 pName
+        // 恰好是 "vkGetInstanceProcAddr" 时会触发无限递归
+        return amethyst_orig_dlsym(RTLD_DEFAULT, pName);
+    }
+    return g_real_vkGetInstanceProcAddr(instance, pName);
+}
+
+/// vkGetDeviceProcAddr wrapper
+/// 拦截 vkCreateGraphicsPipelines、vkCmd* 请求，返回我们的 hook
+static void* amethyst_vkGetDeviceProcAddr(VkZDevice device, const char* pName) {
+    if (pName) {
+        if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) {
+            if (!g_real_vkCreateGraphicsPipelines && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCreateGraphicsPipelines = (PFN_zkCreateGraphicsPipelines)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCreateGraphicsPipelines;
+        }
+        // vkCmd* hooks（dummy pipeline skip draws）
+        if (strcmp(pName, "vkCmdBindPipeline") == 0) {
+            if (!g_real_vkCmdBindPipeline && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCmdBindPipeline = (PFN_zkCmdBindPipeline)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCmdBindPipeline;
+        }
+        if (strcmp(pName, "vkCmdDraw") == 0) {
+            if (!g_real_vkCmdDraw && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCmdDraw = (PFN_zkCmdDraw)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCmdDraw;
+        }
+        if (strcmp(pName, "vkCmdDrawIndexed") == 0) {
+            if (!g_real_vkCmdDrawIndexed && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCmdDrawIndexed = (PFN_zkCmdDrawIndexed)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndexed;
+        }
+        if (strcmp(pName, "vkCmdDrawIndirect") == 0) {
+            if (!g_real_vkCmdDrawIndirect && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCmdDrawIndirect = (PFN_zkCmdDrawIndirect)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndirect;
+        }
+        if (strcmp(pName, "vkCmdDrawIndexedIndirect") == 0) {
+            if (!g_real_vkCmdDrawIndexedIndirect && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCmdDrawIndexedIndirect = (PFN_zkCmdDrawIndexedIndirect)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndexedIndirect;
+        }
+        if (strcmp(pName, "vkCmdDrawIndirectCount") == 0) {
+            if (!g_real_vkCmdDrawIndirectCount && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCmdDrawIndirectCount = (PFN_zkCmdDrawIndirectCount)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndirectCount;
+        }
+        if (strcmp(pName, "vkCmdDrawIndexedIndirectCount") == 0) {
+            if (!g_real_vkCmdDrawIndexedIndirectCount && g_real_vkGetDeviceProcAddr) {
+                g_real_vkCmdDrawIndexedIndirectCount = (PFN_zkCmdDrawIndexedIndirectCount)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkCmdDrawIndexedIndirectCount;
+        }
+        // vkDestroyPipeline hook：dummy pipeline 销毁时跳过，避免 MoltenVK 崩溃
+        if (strcmp(pName, "vkDestroyPipeline") == 0) {
+            if (!g_real_vkDestroyPipeline && g_real_vkGetDeviceProcAddr) {
+                g_real_vkDestroyPipeline = (PFN_zkDestroyPipeline)
+                    g_real_vkGetDeviceProcAddr(device, pName);
+            }
+            return (void*)amethyst_vkDestroyPipeline;
+        }
+    }
+    if (!g_real_vkGetDeviceProcAddr) {
+        // 关键：必须用 amethyst_orig_dlsym 绕过 hooked_dlsym，否则 pName
+        // 恰好是 "vkGetDeviceProcAddr" 时会触发无限递归
+        return amethyst_orig_dlsym(RTLD_DEFAULT, pName);
+    }
+    return g_real_vkGetDeviceProcAddr(device, pName);
+}
+
+/// vkCmdBindPipeline hook
+/// 跟踪当前绑定的 graphics pipeline，dummy pipeline 跳过实际绑定
+static void amethyst_vkCmdBindPipeline(VkZCommandBuffer cmd, VkZPipelineBindPoint bp, VkZPipeline pipeline) {
+    if (bp == VK_Z_PIPELINE_BIND_POINT_GRAPHICS) {
+        g_currentBoundGraphicsPipeline = pipeline;
+        if (isDummyPipeline(pipeline)) {
+            // Dummy pipeline：跳过实际绑定，避免 MoltenVK 因无效句柄崩溃
+            return;
+        }
+    }
+    if (g_real_vkCmdBindPipeline) {
+        g_real_vkCmdBindPipeline(cmd, bp, pipeline);
+    }
+}
+
+/// vkCmdDraw hook：当前绑定 dummy pipeline 时跳过绘制
+static void amethyst_vkCmdDraw(VkZCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
+    if (isDummyPipeline(g_currentBoundGraphicsPipeline)) return;
+    if (g_real_vkCmdDraw) g_real_vkCmdDraw(cmd, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+/// vkCmdDrawIndexed hook：当前绑定 dummy pipeline 时跳过绘制
+static void amethyst_vkCmdDrawIndexed(VkZCommandBuffer cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+    if (isDummyPipeline(g_currentBoundGraphicsPipeline)) return;
+    if (g_real_vkCmdDrawIndexed) g_real_vkCmdDrawIndexed(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
+/// vkCmdDrawIndirect hook：当前绑定 dummy pipeline 时跳过绘制
+static void amethyst_vkCmdDrawIndirect(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint32_t drawCount, uint32_t stride) {
+    if (isDummyPipeline(g_currentBoundGraphicsPipeline)) return;
+    if (g_real_vkCmdDrawIndirect) g_real_vkCmdDrawIndirect(cmd, buffer, offset, drawCount, stride);
+}
+
+/// vkCmdDrawIndexedIndirect hook：当前绑定 dummy pipeline 时跳过绘制
+static void amethyst_vkCmdDrawIndexedIndirect(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint32_t drawCount, uint32_t stride) {
+    if (isDummyPipeline(g_currentBoundGraphicsPipeline)) return;
+    if (g_real_vkCmdDrawIndexedIndirect) g_real_vkCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+}
+
+/// vkCmdDrawIndirectCount hook：当前绑定 dummy pipeline 时跳过绘制
+static void amethyst_vkCmdDrawIndirectCount(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint64_t countBuffer, uint64_t countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
+    if (isDummyPipeline(g_currentBoundGraphicsPipeline)) return;
+    if (g_real_vkCmdDrawIndirectCount) g_real_vkCmdDrawIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
+}
+
+/// vkCmdDrawIndexedIndirectCount hook：当前绑定 dummy pipeline 时跳过绘制
+static void amethyst_vkCmdDrawIndexedIndirectCount(VkZCommandBuffer cmd, uint64_t buffer, uint64_t offset, uint64_t countBuffer, uint64_t countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
+    if (isDummyPipeline(g_currentBoundGraphicsPipeline)) return;
+    if (g_real_vkCmdDrawIndexedIndirectCount) g_real_vkCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
+}
+
+/// vkDestroyPipeline hook：销毁 dummy pipeline 时跳过，避免 MoltenVK 解引用 magic handle 崩溃
+/// 关键修复：切换 shaderpack 时 zink 会销毁所有旧 pipelines，包括 dummy pipeline
+/// 句柄（0xDEAD0001 等）。MoltenVK 的 vkDestroyPipeline 会解引用 pipeline 指针
+/// 查找内部资源，dummy handle 是无效指针，导致 SIGSEGV。
+static void amethyst_vkDestroyPipeline(VkZDevice device, VkZPipeline pipeline, const void* pAllocator) {
+    if (isDummyPipeline(pipeline)) {
+        // Dummy pipeline：跳过销毁，避免 MoltenVK 崩溃
+        // 同时从 dummy pipeline 集合中移除（避免集合无限增长）
+        uintptr_t val = (uintptr_t)pipeline;
+        for (uint32_t i = 0; i < g_dummyPipelineCount; i++) {
+            if (g_dummyPipelines[i] == val) {
+                // 用最后一个元素填补空洞（顺序无关紧要，数组只是用于查找）
+                g_dummyPipelines[i] = g_dummyPipelines[g_dummyPipelineCount - 1];
+                g_dummyPipelineCount--;
+                break;
+            }
+        }
+        // 如果正在销毁的 dummy pipeline 恰好是当前绑定的，清除绑定状态
+        if (g_currentBoundGraphicsPipeline == pipeline) {
+            g_currentBoundGraphicsPipeline = NULL;
+        }
+        return;
+    }
+    if (g_real_vkDestroyPipeline) g_real_vkDestroyPipeline(device, pipeline, pAllocator);
+}
+
+/// 内部：执行 fishhook 重绑定（可在新 image 加载后重复调用以捕获新引用）
+/// fishhook 的 rebind_symbols 是幂等的——会遍历所有已加载 image 并重绑定
+/// vkGetInstanceProcAddr / vkGetDeviceProcAddr 的引用到我们的 wrapper。
+/// 使用静态存储的 rebindings 数组（避免栈上局部变量在 future-image 加载时 UAF：
+/// fishhook 会保留 rebindings 用于后续 dlopen 加载的 image）。
+static void zinkStrideFixRebind(void) {
+    static struct rebinding rebindings[] = {
+        {"vkGetInstanceProcAddr", (void*)amethyst_vkGetInstanceProcAddr, (void**)&g_real_vkGetInstanceProcAddr},
+        {"vkGetDeviceProcAddr", (void*)amethyst_vkGetDeviceProcAddr, (void**)&g_real_vkGetDeviceProcAddr},
+    };
+    rebind_symbols(rebindings, sizeof(rebindings)/sizeof(struct rebinding));
+}
+
+/// 安装 zink vertex stride 对齐 fix
+/// 仅在 zink 渲染器被选中时激活。通过 fishhook 重绑定符号引用，
+/// 并通过 hooked_dlsym 拦截 dlsym 查找（双重机制确保覆盖所有调用路径）。
+void installZinkStrideFix(void) {
+    if (g_zinkStrideFixActive) return;
+
+    const char* renderer = getenv("AMETHYST_RENDERER");
+    if (!renderer || !strstr(renderer, "libOSMesa")) {
+        NSLog(@"[ZinkStrideFix] Skipped (zink not selected, AMETHYST_RENDERER=%s)",
+              renderer ? renderer : "(null)");
+        return;
+    }
+
+    g_zinkStrideFixActive = YES;
+
+    // 初次重绑定（捕获当前已加载 image 的引用，主要是启动器主二进制）
+    zinkStrideFixRebind();
+
+    NSLog(@"[ZinkStrideFix] Installed vertex stride alignment hooks for zink (Mesa 25.0.7 + MoltenVK)");
+}
+
+/// 在新 image（特别是 libOSMesa / libMoltenVK）加载后调用，重新执行 fishhook
+/// 以捕获新 image 对 vkGetInstanceProcAddr / vkGetDeviceProcAddr 的符号引用。
+/// 由 hooked_dlopen 在检测到 libOSMesa 加载时调用。
+void rebindZinkStrideFixForNewImage(void) {
+    if (!g_zinkStrideFixActive) return;
+    zinkStrideFixRebind();
+    NSLog(@"[ZinkStrideFix] Re-rebound Vulkan symbols for newly loaded image");
+}
+
+/// dlsym hook：拦截 Vulkan loader 函数请求，返回我们的 wrapper
+///
+/// 仅拦截 zink stride fix 相关函数：
+///   - vkGetInstanceProcAddr → 返回 amethyst_vkGetInstanceProcAddr
+///     （拦截 vkCreateGraphicsPipelines 调用，强制 stride 4 字节对齐）
+///   - vkGetDeviceProcAddr → 返回 amethyst_vkGetDeviceProcAddr
+///     （拦截 vkCmd* / vkDestroyPipeline 调用，跟踪 dummy pipeline）
+///
+/// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
+void* hooked_dlsym(void* handle, const char* name) {
+    if (name != NULL && g_zinkStrideFixActive) {
+        if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
+            if (!g_real_vkGetInstanceProcAddr) {
+                g_real_vkGetInstanceProcAddr = (PFN_zkGetInstanceProcAddr)orig_dlsym(handle, name);
+            }
+            NSLog(@"[ZinkStrideFix] dlsym intercepted: vkGetInstanceProcAddr -> hook");
+            return (void*)amethyst_vkGetInstanceProcAddr;
+        }
+        if (strcmp(name, "vkGetDeviceProcAddr") == 0) {
+            if (!g_real_vkGetDeviceProcAddr) {
+                g_real_vkGetDeviceProcAddr = (PFN_zkGetDeviceProcAddr)orig_dlsym(handle, name);
+            }
+            NSLog(@"[ZinkStrideFix] dlsym intercepted: vkGetDeviceProcAddr -> hook");
+            return (void*)amethyst_vkGetDeviceProcAddr;
+        }
+    }
+    return orig_dlsym(handle, name);
+}
+
+int hooked_open(const char *path, int oflag, ...) {
+    va_list args;
+    va_start(args, oflag);
+    mode_t mode = va_arg(args, int);
+    va_end(args);
+    if (path && !strcmp(path, "/etc/resolv.conf")) {
+        return orig_open([NSString stringWithFormat:@"%s/resolv.conf", getenv("POJAV_HOME")].UTF8String, oflag, mode);
+    }
+
+    return orig_open(path, oflag, mode);
+}
+
+void init_hookFunctions() {
+    struct rebinding rebindings[] = (struct rebinding[]){
+        {"abort", hooked_abort, (void *)&orig_abort},
+        {"__assert_rtn", hooked___assert_rtn, NULL},
+        {"exit", hooked_exit, (void *)&orig_exit},
+        {"dlopen", hooked_dlopen, (void *)&orig_dlopen},
+        {"dlsym", hooked_dlsym, (void *)&orig_dlsym},
+        {"open", hooked_open, (void *)&orig_open},
+    };
+    rebind_symbols(rebindings, sizeof(rebindings)/sizeof(struct rebinding));
+}
