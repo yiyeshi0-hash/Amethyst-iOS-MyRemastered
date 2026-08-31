@@ -9,13 +9,24 @@
    - `Natives/JavaLauncher.m`: 选 Metal 时设 `AMETHYST_METAL=1`,EGL 渲染器回落 auto 提供 surface
 2. **Metallum agent 注入(`-javaagent:metallum_agent.jar`)**
    - premain 提前加载完整版 libspvc + `ensureSpvcLibraryConfigured`(防止 MoltenVK 阉割版符号 → -4)
-   - ASM 注入 `PreferredGraphicsApi.getBackendsToTry` → 返回 `[Metal, Vulkan, GL]`
+   - ASM 注入 `PreferredGraphicsApi.getBackendsToTry` → 返回 `[Metal, Vulkan, GL]`(26.2)
+   - **1.21.x 多版本分支**: 注入 `RenderSystem.initRenderer`(vanilla/Forge 无 mixin 管线时),agent 内置 1.21.5~1.21.11 各版本的 metallum 类(经 Fabric intermediary 映射重映射为官方混淆名)
    - Fabric/Quilt 实例自动跳过(交给内置 mod,避免 ASM classpath 冲突);agent 内 ASM 已 relocate 为 `com.metallum.asm`
    - Forge 兼容: `ForgeLoadingOverlay.<init>` 注入(GOTO 跳过 logo 纹理强转)
+   - MC 版本由启动器通过 `-Dmetallum.mc.version` 传给 agent
 3. **内置 MetalUniversal mod(开箱即用)**
-   - `mods_preload/MetalUniversal-1.0.4.jar` 首次启动自动拷入实例 `mods/`
+   - `mods_preload/` 首次启动按 MC 版本自动拷入实例 `mods/`(文件名含 `12111` → 1.21.11 实例,其余 → 26.x 实例)
    - Fabric/Quilt 实例自动生效(vanilla 不加载,无害)
 4. **Forge 模块冲突修复**: `com.apple.ios.audio` 从 `libs/lwjgl.jar` 移除(仅保留在 `launcher.jar`),修复 Forge 26.2 JPMS 双模块导出 `ResolutionException`
+
+## 支持的 MC 版本(渲染后端 = Metal)
+
+| MC 版本 | vanilla | Fabric/Quilt | Forge |
+|---------|---------|--------------|-------|
+| **26.2** | ✅ agent 注入 | ✅ 内置 mod | ✅ agent 注入 |
+| **1.21.11** | ✅ agent 注入 | ✅ 内置 mod | ✅ agent 注入 |
+| **1.21.5~1.21.10** | ✅ agent 注入 | ✅ 内置 mod(同 1.21.11 mod) | ✅ agent 注入 |
+| 1.21.4 及更早 | ❌ 无 GpuDevice 抽象(用 Zink) | ❌ | ❌ |
 
 ## 使用
 

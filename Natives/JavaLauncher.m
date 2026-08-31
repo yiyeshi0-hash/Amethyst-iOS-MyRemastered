@@ -536,6 +536,15 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // 内置 MetalUniversal mod 预置: bundle 的 mods_preload/ 首次启动拷贝到实例 mods/
         // (vanilla 实例不加载 mods, 无害; Fabric 实例自动生效 —— 开箱即用)
+        // 按 MC 版本过滤: 文件名含 "12111" 的 mod 仅拷给 1.21.11 实例, 其余仅拷给 26.x 实例
+        NSString *versionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            versionId = launchTarget[@"id"];
+        } else {
+            versionId = launchTarget;
+        }
+        BOOL mc12111 = (versionId && [versionId containsString:@"1.21.11"]);
+        BOOL mc26 = (versionId && [versionId hasPrefix:@"26"]);
         NSString *preloadDir = [[NSBundle mainBundle] pathForResource:@"mods_preload" ofType:nil];
         if (preloadDir) {
             NSString *modsDir = [gameDir stringByAppendingPathComponent:@"mods"];
@@ -543,6 +552,9 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
                                       withIntermediateDirectories:YES attributes:nil error:nil];
             NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:preloadDir error:nil];
             for (NSString *f in files) {
+                BOOL is12111Mod = [f containsString:@"12111"];
+                if (is12111Mod && !mc12111) continue;   // 1.21.11 专用 mod, 非 1.21.11 实例跳过
+                if (!is12111Mod && mc12111) continue;   // 26.x 专用 mod, 1.21.11 实例跳过
                 NSString *srcPath = [preloadDir stringByAppendingPathComponent:f];
                 NSString *dstPath = [modsDir stringByAppendingPathComponent:f];
                 if (![[NSFileManager defaultManager] fileExistsAtPath:dstPath]) {
@@ -868,6 +880,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         && [[NSFileManager defaultManager] fileExistsAtPath:
             [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
+        // 把 MC 版本 id 传给 agent(1.21.x 多版本分支需要按版本选 metallum 类映射)
+        NSString *mcVersionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            mcVersionId = launchTarget[@"id"];
+        } else {
+            mcVersionId = launchTarget;
+        }
+        if (mcVersionId && mcVersionId.length > 0) {
+            PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", mcVersionId);
+        }
     }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
