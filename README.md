@@ -24,9 +24,16 @@
 | MC 版本 | vanilla | Fabric/Quilt | Forge |
 |---------|---------|--------------|-------|
 | **26.2** | ✅ agent 注入 | ✅ 内置 mod | ✅ agent 注入 |
-| **1.21.11** | ✅ agent 注入 | ✅ 内置 mod | ✅ agent 注入 |
-| **1.21.5~1.21.10** | ✅ agent 注入 | ✅ 内置 mod(同 1.21.11 mod) | ✅ agent 注入 |
+| **1.21.11** | ✅ agent 注入(实测可玩: 纹理图集/区块渲染/世界进入全通; 启动遮罩需手动取消一次, launcher 首帧通知依赖 GL swap 路径) | ✅ 内置 mod | ✅ agent 注入 |
+| **1.21.5~1.21.10** | 🚧 适配中(GpuBuffer 等 1.21.11 新增 API 差异) | 🚧 | 🚧 |
+| **26.1/26.1.1/26.1.2** | 🚧 适配中(yarn named 残留映射, 26.1 无官方映射文件) | 🚧 | 🚧 |
 | 1.21.4 及更早 | ❌ 无 GpuDevice 抽象(用 Zink) | ❌ | ❌ |
+
+## 类加载适配链(1.21.x/26.1, 供后续参考)
+
+- slf4j: 各版本自带真实 slf4j-api 2.0.x, agent 零 stub, premain 从 `user.dir/libraries` append; metallum 日志统一 NopLogger(零依赖)
+- 枚举 ordinal/record 访问器(comp_XXXX)经各版本 tiny 映射(intermediary→官方); 枚举 ordinal 继承自 java.lang.Enum(类文件无, 运行时存在)
+- 1.21.5-1.21.10 特有: createTexture/createBuffer 参数序不同(桥接方法)、GpuTexture 5 参构造器(MetalGpuTexture super 重写)、GpuBuffer 为接口(1.21.11 为抽象类, 待适配)
 
 ## 使用
 
