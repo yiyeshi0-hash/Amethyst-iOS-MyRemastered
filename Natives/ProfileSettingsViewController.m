@@ -354,9 +354,8 @@ static NSString * localizeProfileTitle(NSString *title) {
 
     // ===== 副标题（游戏目录，12pt regular，secondaryLabelColor）=====
     UILabel *subtitleLabel = [[UILabel alloc] init];
-    NSString *gameDir = self.profile[@"gameDir"] ?: @".";
     NSString *instanceName = getPrefObject(@"general.game_directory") ?: @"default";
-    subtitleLabel.text = [NSString stringWithFormat:@"%@ → /instances/%@", gameDir, instanceName];
+    subtitleLabel.text = [NSString stringWithFormat:@"%@ → /instances/%@", [self resolvedGameDirSegment], instanceName];
     subtitleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
     subtitleLabel.textColor = [UIColor secondaryLabelColor];
     subtitleLabel.adjustsFontSizeToFitWidth = YES;
@@ -447,15 +446,23 @@ static NSString * localizeProfileTitle(NSString *title) {
                 NSString *currentVersion = self.profile[@"lastVersionId"];
                 label.text = currentVersion.length > 0 ? currentVersion : localize(@"i18n_str_864", nil);
             } else {
-                NSString *gameDir = self.profile[@"gameDir"] ?: @".";
                 NSString *instanceName = getPrefObject(@"general.game_directory") ?: @"default";
-                label.text = [NSString stringWithFormat:@"%@ → /instances/%@", gameDir, instanceName];
+                label.text = [NSString stringWithFormat:@"%@ → /instances/%@", [self resolvedGameDirSegment], instanceName];
             }
         }
     }
 }
 
 #pragma mark - Memory
+
+/// 实际生效的游戏目录段: 版本隔离开启时返回版本 id, 否则返回 profile.gameDir("." 或子目录)。
+- (NSString *)resolvedGameDirSegment {
+    if ([self.profile[@"gameDirIsolation"] boolValue]) {
+        NSString *versionId = self.profile[@"lastVersionId"];
+        return versionId.length > 0 ? versionId : @".isolated";
+    }
+    return self.profile[@"gameDir"] ?: @".";
+}
 
 - (void)calculateMaxMemory {
     long long totalMemory = [NSProcessInfo processInfo].physicalMemory;
@@ -719,8 +726,7 @@ static NSString * localizeProfileTitle(NSString *title) {
             } else if ([title isEqualToString:@"游戏目录"]) {
                 cell.imageView.image = [UIImage systemImageNamed:@"folder"];
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                NSString *gameDir = self.profile[@"gameDir"] ?: @".";
-                cell.detailTextLabel.text = gameDir;
+                cell.detailTextLabel.text = [self resolvedGameDirSegment];
             }
             break;
 

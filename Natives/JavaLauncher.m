@@ -529,10 +529,30 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         NSLog(@"[JavaLauncher] GRAPHICS_API is set to %@\n", graphicsApi);
 
         // Setup gameDir
-        gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
-            getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
-            [PLProfiles resolveKeyForCurrentProfile:@"gameDir"]]
-            .stringByStandardizingPath;
+        // 版本隔离(profile 开关 gameDirIsolation=YES): 在实例目录下按 MC 版本 id 再分一层
+        // (instances/<实例>/<版本id>/), 使不同版本各自的 mods/config/saves/crash-reports
+        // 互不污染。版本 id 做目录名安全化(仅保留 [A-Za-z0-9._-])。
+        NSString *profileGameDir = [PLProfiles resolveKeyForCurrentProfile:@"gameDir"];
+        BOOL isolateByVersion = [[PLProfiles.current.selectedProfile objectForKey:@"gameDirIsolation"] boolValue];
+        if (isolateByVersion && [launchTarget isKindOfClass:NSDictionary.class]) {
+            NSString *isoVersionId = launchTarget[@"id"];
+            NSCharacterSet *allowedDirChars = [NSCharacterSet characterSetWithCharactersInString:
+                @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"];
+            isoVersionId = [[isoVersionId componentsSeparatedByCharactersInSet:[allowedDirChars invertedSet]]
+                componentsJoinedByString:@"_"];
+            if (isoVersionId.length == 0) {
+                isoVersionId = @"unknown";
+            }
+            NSLog(@"[JavaLauncher] Version isolation enabled: gameDir -> instances/%@/%@",
+                getPrefObject(@"general.game_directory"), isoVersionId);
+            gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
+                getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"), isoVersionId]
+                .stringByStandardizingPath;
+        } else {
+            gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
+                getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"), profileGameDir]
+                .stringByStandardizingPath;
+        }
 
         // 内置 MetalUniversal mod 预置: bundle 的 mods_preload/ 首次启动拷贝到实例 mods/
         // (vanilla 实例不加载 mods, 无害; Fabric 实例自动生效 —— 开箱即用)

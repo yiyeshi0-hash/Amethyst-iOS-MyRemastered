@@ -122,6 +122,11 @@
               @"type": self.typeTextField,
               @"placeholder": [NSString stringWithFormat:@". -> /Documents/instances/%@", getPrefObject(@"general.game_directory")]
             },
+            @{@"key": @"gameDirIsolation",
+              @"icon": @"square.stack.3d.up",
+              @"title": @"版本隔离：不同 MC 版本分开存放(mods/配置/存档独立)",
+              @"type": self.typeSwitch
+            },
             // Video and renderer settings
             @{@"key": @"renderer",
               @"icon": @"cpu",
