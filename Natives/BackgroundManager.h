@@ -80,8 +80,6 @@ typedef NS_ENUM(NSInteger, BackgroundUIEffect) {
 
 // Apply UI effect to navigation bar and toolbar
 - (void)applyEffectToNavigationBar:(UINavigationBar *)navigationBar;
-- (void)applyGlassHighlightToView:(UIView *)view;
-- (void)removeGlassHighlightFromView:(UIView *)view;
 - (void)applyEffectToToolbar:(UIToolbar *)toolbar;
 
 // Apply UI effect settings to current split view controller
