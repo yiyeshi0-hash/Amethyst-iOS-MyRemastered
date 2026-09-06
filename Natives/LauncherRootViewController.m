@@ -239,6 +239,8 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     self.sidebarContainer.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner;
     self.sidebarContainer.layer.masksToBounds = YES;
     [[BackgroundManager sharedManager] applyEffectToView:self.sidebarContainer];
+    // Liquid Glass 上缘高光（液态玻璃观感；iOS 13+ 通用，老系统安全）
+    [[BackgroundManager sharedManager] applyGlassHighlightToView:self.sidebarContainer];
     [self.view addSubview:self.sidebarContainer];
 
     // 中间内容容器 - 完全透明，四角直角（内部塞入 nav controller + table view，圆角会裁剪内容且无视觉收益）
@@ -254,6 +256,8 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     self.rightPanelContainer.layer.maskedCorners = kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner;
     self.rightPanelContainer.layer.masksToBounds = YES;
     [[BackgroundManager sharedManager] applyEffectToView:self.rightPanelContainer];
+    // Liquid Glass 上缘高光（液态玻璃观感；iOS 13+ 通用，老系统安全）
+    [[BackgroundManager sharedManager] applyGlassHighlightToView:self.rightPanelContainer];
     [self.view addSubview:self.rightPanelContainer];
     
     // 设置约束
@@ -587,6 +591,14 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     // 重新应用毛玻璃/半透明效果到容器视图
     [[BackgroundManager sharedManager] applyEffectToView:self.sidebarContainer];
     [[BackgroundManager sharedManager] applyEffectToView:self.rightPanelContainer];
+    // 同步液态玻璃高光：blur 模式加、半透明模式移除（半透明模式不适用高光）
+    if ([[BackgroundManager sharedManager] uiEffect] == BackgroundUIEffectBlur) {
+        [[BackgroundManager sharedManager] applyGlassHighlightToView:self.sidebarContainer];
+        [[BackgroundManager sharedManager] applyGlassHighlightToView:self.rightPanelContainer];
+    } else {
+        [[BackgroundManager sharedManager] removeGlassHighlightFromView:self.sidebarContainer];
+        [[BackgroundManager sharedManager] removeGlassHighlightFromView:self.rightPanelContainer];
+    }
 }
 
 - (void)dealloc {
