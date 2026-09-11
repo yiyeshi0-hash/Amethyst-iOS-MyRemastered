@@ -1,50 +1,41 @@
 # Air-Metal (Amethyst iOS Remastered + Metal Universal)
 
-**本 fork 基于官方 [Amethyst-iOS-MyRemastered](https://github.com/herbrine8403/Amethyst-iOS-MyRemastered) `48a0202`,集成 Metal Universal 原生 Metal 渲染,vanilla / Fabric / Forge 三种形态开箱即用。**
+**本 fork 基于官方 [Amethyst-iOS-MyRemastered](https://github.com/herbrine8403/Amethyst-iOS-MyRemastered) `48a0202`,集成 Metal Universal 原生 Metal 渲染(Minecraft **26.2**,vanilla / Fabric / Forge 三形态实测可玩)。**
 
 ## 改版内容
 
 1. **启动器渲染器新增 "Metal (metallum)" 选项**(设置 → 游戏设置 → 渲染器)
    - `Natives/utils.h` / `Natives/LauncherPreferences.m`: 渲染器列表加 Metal
-   - `Natives/JavaLauncher.m`: 选 Metal 时设 `AMETHYST_METAL=1`,EGL 渲染器回落 auto 提供 surface
+   - `Natives/JavaLauncher.m`: 选 Metal 时设 `AMETHYST_METAL=1`,EGL 渲染器回落 auto 提供 surface;选择该渲染器时弹出一次性注意事项(已知限制)
 2. **Metallum agent 注入(`-javaagent:metallum_agent.jar`)**
    - premain 提前加载完整版 libspvc + `ensureSpvcLibraryConfigured`(防止 MoltenVK 阉割版符号 → -4)
-   - ASM 注入 `PreferredGraphicsApi.getBackendsToTry` → 返回 `[Metal, Vulkan, GL]`(26.2)
-   - **1.21.x 多版本分支**: 注入 `RenderSystem.initRenderer`(vanilla/Forge 无 mixin 管线时),agent 内置 1.21.5~1.21.11 各版本的 metallum 类(经 Fabric intermediary 映射重映射为官方混淆名)
-   - Fabric/Quilt 实例自动跳过(交给内置 mod,避免 ASM classpath 冲突);agent 内 ASM 已 relocate 为 `com.metallum.asm`
-   - Forge 兼容: `ForgeLoadingOverlay.<init>` 注入(GOTO 跳过 logo 纹理强转)
-   - MC 版本由启动器通过 `-Dmetallum.mc.version` 传给 agent
-3. **内置 MetalUniversal mod(开箱即用)**
-   - `mods_preload/` 首次启动按 MC 版本自动拷入实例 `mods/`(文件名含 `12111` → 1.21.11 实例,其余 → 26.x 实例)
-   - Fabric/Quilt 实例自动生效(vanilla 不加载,无害)
-4. **Forge 模块冲突修复**: `com.apple.ios.audio` 从 `libs/lwjgl.jar` 移除(仅保留在 `launcher.jar`),修复 Forge 26.2 JPMS 双模块导出 `ResolutionException`
+   - ASM 注入 `PreferredGraphicsApi.getBackendsToTry` → 返回 `[Metal, Vulkan, GL]`
+   - Fabric/Quilt 实例自动跳过 agent(避免与 fabric-loader 的 classpath 校验冲突),改由预置的 Metal mod 接管
+   - Forge 兼容: `ForgeLoadingOverlay.<init>` 注入(GOTO 跳过 logo 纹理强转)—— Forge 自带加载界面会被跳过,直接进入主菜单,属预期行为
+3. **预置 Metal 渲染 mod**
+   - bundle 内 `mods_preload/MetalUniversal-1.0.4.jar` 首次启动拷入实例 `mods/`(仅 Metal mod 自动预置,其他 mod 不受影响)
+   - Fabric/Quilt 实例自动生效(vanilla / Forge 不加载该 mod,无害)
+4. **Forge 模块冲突修复**: `com.apple.ios.audio` 从 `libs/lwjgl.jar` 移除(仅保留在 `launcher.jar`),修复 Forge 26.2 的 JPMS 双模块导出 `ResolutionException`
 
-## 支持的 MC 版本(渲染后端 = Metal)
+## 支持矩阵(渲染后端 = Metal)
 
 | MC 版本 | vanilla | Fabric/Quilt | Forge |
 |---------|---------|--------------|-------|
-| **26.2** | ✅ agent 注入 | ✅ 内置 mod | ✅ agent 注入 |
-| **1.21.11** | ✅ 实测可玩(文字正常, 纹理图集/区块渲染/世界全通) | ✅ 内置 mod | ✅ agent 注入 |
-| **1.21.10** | ✅ 实测可玩(世界稳定跑; 文字= v95白字, 阴影加粗待 native 修) | ✅ 内置 mod | ✅ agent 注入 |
-| **1.21.9** | ✅ 实测可玩 | ✅ | ✅ |
-| **1.21.8** | 🚧 纹理上传 `_platform_memmove` SIGSEGV(更大图集 + transient memory 撑爆) | 🚧 | 🚧 |
-| **1.21.5 / 1.21.6 / 1.21.7** | 🚧 接口方法未实现/世代差(GpuBuffer 为接口等差异) | 🚧 | 🚧 |
-| **26.1/26.1.1/26.1.2** | 🚧 适配中(yarn named 残留映射, 26.1 无官方映射文件) | 🚧 | 🚧 |
-| 1.21.4 及更早 | ❌ 无 GpuDevice 抽象(用 Zink) | ❌ | ❌ |
+| **26.2** | ✅ 实测可玩 | ✅ 实测可玩 | ✅ 实测可玩 |
 
-> **当前 bundle = `metallum_agent.jar` v105**: 含 1.21.5~1.21.11 + 26.x 全版本类集; 1.21.9 / 1.21.10 / 1.21.11 实测正常, 1.21.8(纹理上传越界)与 1.21.5-7(接口/世代差)为已知待修项。
+## 已知限制
 
-## 类加载适配链(1.21.x/26.1, 供后续参考)
-
-- slf4j: 各版本自带真实 slf4j-api 2.0.x, agent 零 stub, premain 从 `user.dir/libraries` append; metallum 日志统一 NopLogger(零依赖)
-- 枚举 ordinal/record 访问器(comp_XXXX)经各版本 tiny 映射(intermediary→官方); 枚举 ordinal 继承自 java.lang.Enum(类文件无, 运行时存在)
-- 1.21.5-1.21.10 特有: createTexture/createBuffer 参数序不同(桥接方法)、GpuTexture 5 参构造器(MetalGpuTexture super 重写)、GpuBuffer 为接口(1.21.11 为抽象类, 待适配)
+- 光影包(Iris / OptiFine 风格)不支持(Metal 路径与 GL 架构差异)
+- 部分 mod 可能不兼容(如 Sodium 等性能优化 mod);游戏崩溃时先移除 mod 再试
+- Forge 实例的启动遮罩偶需手动关闭(听到音乐即已进入游戏);Forge 自带加载界面会被跳过
+- 首次选择 Metal 渲染器时,启动器会弹出一次性注意事项说明上述限制
+- 后端由 `metallum` 提供(上游 [MetalUniversal](https://github.com/EternityQwQ/MetalUniversal));shader 经 SPIRV-Cross 交叉编译至 Metal
 
 ## 使用
 
 - 安装后: 启动器 → 游戏设置 → 渲染器 → **Metal (metallum)**
 - JIT: StikDebug 附加 + 调试设置两个开关(Use Universal StikDebug Script / Keep attached to StikDebug)
-- 实测(iPhone 17 Pro / A19 Pro / iOS 27.0): 32 区块 105+ 帧
+- 实测环境: iPhone 17 Pro (A19 Pro) / iOS 27.0
 - 详细说明见 `METAL_TUTORIAL.txt`
 
 ## 构建

@@ -477,6 +477,10 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             setenv("AMETHYST_METAL", "1", 1);
             NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL renderer falls back to auto for surface)");
             renderer = @"auto";
+            // Metal (metallum) 渲染器注意事项: 提示已知限制
+            showDialog(localize(@"metal.renderer.notice.title", @"Metal Renderer"),
+                       localize(@"metal.renderer.notice.body", @""));
+
         }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
@@ -529,42 +533,13 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         NSLog(@"[JavaLauncher] GRAPHICS_API is set to %@\n", graphicsApi);
 
         // Setup gameDir
-        // 版本隔离(profile 开关 gameDirIsolation=YES): 在实例目录下按 MC 版本 id 再分一层
-        // (instances/<实例>/<版本id>/), 使不同版本各自的 mods/config/saves/crash-reports
-        // 互不污染。版本 id 做目录名安全化(仅保留 [A-Za-z0-9._-])。
-        NSString *profileGameDir = [PLProfiles resolveKeyForCurrentProfile:@"gameDir"];
-        BOOL isolateByVersion = [[PLProfiles.current.selectedProfile objectForKey:@"gameDirIsolation"] boolValue];
-        if (isolateByVersion && [launchTarget isKindOfClass:NSDictionary.class]) {
-            NSString *isoVersionId = launchTarget[@"id"];
-            NSCharacterSet *allowedDirChars = [NSCharacterSet characterSetWithCharactersInString:
-                @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"];
-            isoVersionId = [[isoVersionId componentsSeparatedByCharactersInSet:[allowedDirChars invertedSet]]
-                componentsJoinedByString:@"_"];
-            if (isoVersionId.length == 0) {
-                isoVersionId = @"unknown";
-            }
-            NSLog(@"[JavaLauncher] Version isolation enabled: gameDir -> instances/%@/%@",
-                getPrefObject(@"general.game_directory"), isoVersionId);
-            gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
-                getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"), isoVersionId]
-                .stringByStandardizingPath;
-        } else {
-            gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
-                getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"), profileGameDir]
-                .stringByStandardizingPath;
-        }
+        gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
+            getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
+            [PLProfiles resolveKeyForCurrentProfile:@"gameDir"]]
+            .stringByStandardizingPath;
 
-        // 内置 MetalUniversal mod 预置: bundle 的 mods_preload/ 首次启动拷贝到实例 mods/
-        // (vanilla 实例不加载 mods, 无害; Fabric 实例自动生效 —— 开箱即用)
-        // 按 MC 版本过滤: 文件名含 "12111" 的 mod 仅拷给 1.21.11 实例, 其余仅拷给 26.x 实例
-        NSString *versionId = nil;
-        if ([launchTarget isKindOfClass:NSDictionary.class]) {
-            versionId = launchTarget[@"id"];
-        } else {
-            versionId = launchTarget;
-        }
-        BOOL mc12111 = (versionId && [versionId containsString:@"1.21.11"]);
-        BOOL mc26 = (versionId && [versionId hasPrefix:@"26"]);
+        // 预置 Metal 渲染 mod(MetalUniversal, bundle 的 mods_preload/ 内):
+        // 首次启动拷入实例 mods/ —— 仅 Metal mod 自动进入实例, 其他辅助 mod 不再自动拷贝。
         NSString *preloadDir = [[NSBundle mainBundle] pathForResource:@"mods_preload" ofType:nil];
         if (preloadDir) {
             NSString *modsDir = [gameDir stringByAppendingPathComponent:@"mods"];
@@ -572,18 +547,17 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
                                       withIntermediateDirectories:YES attributes:nil error:nil];
             NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:preloadDir error:nil];
             for (NSString *f in files) {
-                BOOL is12111Mod = [f containsString:@"12111"];
-                if (is12111Mod && !mc12111) continue;   // 1.21.11 专用 mod, 非 1.21.11 实例跳过
-                if (!is12111Mod && mc12111) continue;   // 26.x 专用 mod, 1.21.11 实例跳过
+                if ([f.lowercaseString rangeOfString:@"metal"].location == NSNotFound) continue;  // 仅预置 Metal mod
                 NSString *srcPath = [preloadDir stringByAppendingPathComponent:f];
                 NSString *dstPath = [modsDir stringByAppendingPathComponent:f];
                 if (![[NSFileManager defaultManager] fileExistsAtPath:dstPath]) {
                     if ([[NSFileManager defaultManager] copyItemAtPath:srcPath toPath:dstPath error:nil]) {
-                        NSLog(@"[JavaLauncher] Preloaded bundled mod: %@", f);
+                        NSLog(@"[JavaLauncher] Preloaded Metal mod: %@", f);
                     }
                 }
             }
         }
+
     } else {
         defaultJRETag = @"execute_jar";
         gameDir = @(getenv("POJAV_GAME_DIR"));
@@ -900,7 +874,7 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         && [[NSFileManager defaultManager] fileExistsAtPath:
             [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
-        // 把 MC 版本 id 传给 agent(1.21.x 多版本分支需要按版本选 metallum 类映射)
+        // 把 MC 版本 id 传给 agent(agent 按版本选择对应的 metallum 类映射)
         NSString *mcVersionId = nil;
         if ([launchTarget isKindOfClass:NSDictionary.class]) {
             mcVersionId = launchTarget[@"id"];
