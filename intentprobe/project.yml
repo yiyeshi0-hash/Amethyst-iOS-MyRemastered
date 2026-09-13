@@ -1,0 +1,14 @@
+name: IntentProbe
+options:
+  bundleIdPrefix: com.probe
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  IntentProbe:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
