@@ -5,10 +5,14 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: select-xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - name: env
         run: |
-          xcodebuild -version | head -2
-          ls /Applications | grep -i "^Xcode" | head -3 || true
+          xcodebuild -version
+          xcode-select -p
           xcrun --sdk iphoneos --show-sdk-path
           swiftc --version 2>&1 | head -2
       - name: install-xcodegen
@@ -17,21 +21,27 @@ jobs:
         working-directory: intentprobe
         run: |
           xcodegen generate
-          xcodebuild -project IntentProbe.xcodeproj -scheme IntentProbe -sdk iphoneos -configuration Debug CODE_SIGNING_ALLOWED=NO build 2>&1 | tee build.log | tail -5
+          xcodebuild -project IntentProbe.xcodeproj -scheme IntentProbe -sdk iphoneos -configuration Debug CODE_SIGNING_ALLOWED=NO build 2>&1 | tee build.log | tail -8
       - name: evidence
         working-directory: intentprobe
         run: |
-          echo "===== swift const-values args ====="
+          echo "===== swift const-values flags ====="
           grep -o -- "-emit-const-values-path [^ ]*" build.log | head -5 || true
-          grep -o -- "-enable-experimental-feature [A-Za-z]*" build.log | head -5 || true
+          grep -o -- "emit-const-values[^ ]*" build.log | head -5 || true
           echo "===== metadata processor invocation ====="
           grep -o "appintentsmetadataprocessor.*" build.log | head -3 || true
           echo "===== swiftconstvalues artifacts ====="
-          find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" | head -5 || true
-          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" | head -2); do echo "--- $f ---"; head -c 900 "$f"; echo; done
+          find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" 2>/dev/null | head -5 || true
+          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" 2>/dev/null | head -2); do echo "--- $f ---"; head -c 1200 "$f"; echo; done
           echo "===== extract.actionsdata ====="
-          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "extract.actionsdata" | head -2); do echo "--- $f ($(wc -c < $f) B) ---"; head -c 900 "$f"; echo; done
+          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "extract.actionsdata" 2>/dev/null | head -2); do echo "--- $f ($(wc -c < $f) B) ---"; head -c 1500 "$f"; echo; done
+          echo "===== nlu ====="
+          find ~/Library/Developer/Xcode/DerivedData -path "*Metadata.appintents*" -type f 2>/dev/null | head -10 || true
+          mkdir -p /tmp/meta
+          for d in $(find ~/Library/Developer/Xcode/DerivedData -name "Metadata.appintents" -type d 2>/dev/null | head -2); do cp -R "$d" /tmp/meta/ 2>/dev/null || true; done
+          cp build.log /tmp/meta/ 2>/dev/null || true
+          ls -la /tmp/meta || true
       - uses: actions/upload-artifact@v4
         with:
-          name: probe
-          path: intentprobe/build.log
+          name: probe-meta
+          path: /tmp/meta
