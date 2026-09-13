@@ -12,9 +12,7 @@ jobs:
       - name: env
         run: |
           xcodebuild -version
-          xcode-select -p
           xcrun --sdk iphoneos --show-sdk-path
-          swiftc --version 2>&1 | head -2
       - name: install-xcodegen
         run: brew install xcodegen
       - name: build
@@ -25,23 +23,32 @@ jobs:
       - name: evidence
         working-directory: intentprobe
         run: |
-          echo "===== swift const-values flags ====="
-          grep -o -- "-emit-const-values-path [^ ]*" build.log | head -5 || true
-          grep -o -- "emit-const-values[^ ]*" build.log | head -5 || true
-          echo "===== metadata processor invocation ====="
-          grep -o "appintentsmetadataprocessor.*" build.log | head -3 || true
-          echo "===== swiftconstvalues artifacts ====="
-          find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" 2>/dev/null | head -5 || true
-          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" 2>/dev/null | head -2); do echo "--- $f ---"; head -c 1200 "$f"; echo; done
-          echo "===== extract.actionsdata ====="
-          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "extract.actionsdata" 2>/dev/null | head -2); do echo "--- $f ($(wc -c < $f) B) ---"; head -c 1500 "$f"; echo; done
-          echo "===== nlu ====="
-          find ~/Library/Developer/Xcode/DerivedData -path "*Metadata.appintents*" -type f 2>/dev/null | head -10 || true
-          mkdir -p /tmp/meta
-          for d in $(find ~/Library/Developer/Xcode/DerivedData -name "Metadata.appintents" -type d 2>/dev/null | head -2); do cp -R "$d" /tmp/meta/ 2>/dev/null || true; done
-          cp build.log /tmp/meta/ 2>/dev/null || true
-          ls -la /tmp/meta || true
+          echo "########## A. const/gather 相关参数 ##########"
+          grep -o -- "-emit-const-values[^ ]*" build.log | head -3 || true
+          grep -o -- "-const-gather-protocols-file" build.log | head -3 || true
+          echo "########## B. 协议清单文件路径 ##########"
+          grep -o -- "/Users/runner/[^ \"']*" build.log | grep -i -E "gather|protocol|const" | sort -u | head -10 || true
+          echo "########## C. 该文件内容 ##########"
+          for p in $(grep -o -- "/Users/runner/[^ \"']*" build.log | grep -i -E "gather|protocol|const" | sort -u | head -5); do
+            echo "--- $p ---"
+            cat "$p" 2>/dev/null | head -80 || true
+            echo
+          done
+          echo "########## D. DerivedData 里的 txt 清单 ##########"
+          find ~/Library/Developer/Xcode/DerivedData -name "*.txt" 2>/dev/null | head -25 || true
+          for p in $(find ~/Library/Developer/Xcode/DerivedData -name "*.txt" 2>/dev/null | head -25); do
+            echo "--- $p ($(wc -c < "$p") B) ---"; head -c 400 "$p"; echo
+          done
+          echo "########## E. Metadata.appintents ##########"
+          find ~/Library/Developer/Xcode/DerivedData -path "*Metadata.appintents*" 2>/dev/null | head -10 || true
+          for f in $(find ~/Library/Developer/Xcode/DerivedData -name extract.actionsdata 2>/dev/null | head -1); do
+            echo "--- $f ($(wc -c < "$f") B) ---"; head -c 2500 "$f"; echo
+          done
+          echo "########## F. 完整编译行 ##########"
+          grep -m1 "swift-frontend -frontend -c" build.log | tr ' ' '\n' | grep -n -E "const|gather|emit" | head -20 || true
+          echo "########## G. 处理器调用 ##########"
+          grep -o "appintentsmetadataprocessor.\{0,900\}" build.log | head -1 || true
       - uses: actions/upload-artifact@v4
         with:
-          name: probe-meta
-          path: /tmp/meta
+          name: probe-log
+          path: intentprobe/build.log
