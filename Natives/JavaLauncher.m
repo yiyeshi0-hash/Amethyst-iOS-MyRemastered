@@ -63,16 +63,16 @@ void init_loadDefaultEnv() {
         setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "1", 1);
         setenv("MVK_CONFIG_LOG_LEVEL", "2", 1); // 仍然抑制 info 级别，但 performance log 会输出
         // 尝试强制 present mode 为 IMMEDIATE（不等 vsync）。
-        // MoltenVK 1.2.5+ 支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量：
+        // MoltenVK 1.2.5+/1.4.3 支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量：
         //   0 = VK_PRESENT_MODE_IMMEDIATE_KHR（不等 vsync，帧率可超屏幕刷新率）
         //   1 = VK_PRESENT_MODE_MAILBOX_KHR
         //   2 = VK_PRESENT_MODE_FIFO_KHR（默认，等 vsync）
-        // 实际运行的 MoltenVK 版本为 1.2.9（从 libMoltenVK.dylib 二进制确认），
+        // 实际运行的 MoltenVK 版本为 1.4.3（从 libMoltenVK.dylib 二进制确认），
         // 支持此环境变量。仓库中的 vk_mvk_moltenvk.h 头文件是旧版本（1.1.2），
-        // 但实际 dylib 已是 1.2.9，环境变量会生效。
+        // 但实际 dylib 已是 1.4.3，环境变量会生效。
         // 这是 Vulkan 模式帧率解锁的关键：present mode 完全由 vkCreateSwapchainKHR
         // 选择，而 MC 26.2 的 Vulkan 渲染器可能未正确响应 enableVsync=false。
-        // MoltenVK 1.2.9 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode。
+        // MoltenVK 1.4.3 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode。
         setenv("MVK_CONFIG_SWAPCHAIN_PRESENT_MODE", "0", 1);
         NSLog(@"[JavaLauncher] MoltenVK performance tracking + IMMEDIATE present mode requested for VSync diagnosis");
     } else {
@@ -105,10 +105,10 @@ void init_loadDefaultEnv() {
     //    Mesa 21.0 的 zink 不会动态重建 swapchain，导致帧率锁死在屏幕刷新率。
     //
     // 关于 MoltenVK 配置与 Vulkan 帧率解锁研究：
-    //   实际运行的 MoltenVK 版本为 1.2.9（从 libMoltenVK.dylib 二进制确认）。
+    //   实际运行的 MoltenVK 版本为 1.4.3（从 libMoltenVK.dylib 二进制确认）。
     //   仓库中的 vk_mvk_moltenvk.h 头文件是旧版本（1.1.2, spec 30），
-    //   但实际 dylib 已是 1.2.9，支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量。
-    //   MoltenVK 1.2.9 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode，
+    //   但实际 dylib 已是 1.4.3，支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量。
+    //   MoltenVK 1.4.3 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode，
     //   这是 Vulkan 模式帧率解锁的关键机制。
     //   设备是否支持 IMMEDIATE present mode 由 MVKPhysicalDeviceMetalFeatures.presentModeImmediate
     //   自动检测（大多数 iOS 设备支持）。
@@ -116,7 +116,7 @@ void init_loadDefaultEnv() {
     //   Vulkan 模式帧率解锁的多层机制：
     //   1. MC 选项层：enableVsync=false + maxFps=260（MC 1.16+ 视 260 为 unlimited）
     //   2. MoltenVK 配置层：MVK_CONFIG_SWAPCHAIN_PRESENT_MODE=0 → IMMEDIATE present mode
-    //      （MoltenVK 1.2.9 支持，覆盖应用在 vkCreateSwapchainKHR 选择的 presentMode）
+    //      （MoltenVK 1.4.3 支持，覆盖应用在 vkCreateSwapchainKHR 选择的 presentMode）
     //   3. MC 26.2 兼容：同时写入 maxFps/maxFramerate/framerateLimit 多种选项名
     //
     // 各渲染器的帧率解锁效果：
@@ -477,9 +477,13 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             setenv("AMETHYST_METAL", "1", 1);
             NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL renderer falls back to auto for surface)");
             renderer = @"auto";
-            // Metal (metallum) 渲染器注意事项: 提示已知限制
-            showDialog(localize(@"metal.renderer.notice.title", @"Metal Renderer"),
-                       localize(@"metal.renderer.notice.body", @""));
+            // Metal (metallum) 渲染器注意事项。
+            // 这里原本弹一个 UIAlertController 提示已知限制, 但 SDL3 接管窗口后该 alert
+            // 收不到触摸("确定"按不动), 会把游戏永久挡在弹窗后面 —— 表现为"进了游戏但
+            // 戳屏幕没反应"。改为只打日志, 不再阻塞启动。
+            NSLog(@"[JavaLauncher] Metal renderer notice: %@ - %@",
+                  localize(@"metal.renderer.notice.title", @"Metal Renderer"),
+                  localize(@"metal.renderer.notice.body", @""));
 
         }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
@@ -698,9 +702,19 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     if (surfaceVCClass && [surfaceVCClass respondsToSelector:@selector(surface)]) {
         id surfaceView = [surfaceVCClass performSelector:@selector(surface)];
         if (surfaceView) {
+            // [AMETHYST-FIX] 发布的 scale 必须与「传给游戏的窗口尺寸」一致。
+            // 尺寸用的是 windowWidth = physicalWidth * resolutionScale (视频分辨率选项, 150% => 3932),
+            // 而这里原本只给 UIScreen.scale (3.0) —— 两者自相矛盾, 导致:
+            //   ① 游戏按 scale=3.0 建的 Metal drawable 只有 2622 (分辨率选项形同虚设);
+            //   ② 游戏内部「鼠标 -> GUI」换算用的是它的 3932 口径, 推给它的坐标被整体
+            //      缩小 2622/3932 = 0.667 → 悬停/点击偏左上 1/3 (右下角按钮点不到)。
+            // 乘上 resolutionScale 后 drawable = 874 * 4.5 = 3933, 与 3932 口径一致, 两个问题一起消失。
+            const double amethystPublishedScale = (double)UIScreen.mainScreen.scale
+                    * (resolutionScale > 0.0f ? (double)resolutionScale : 1.0);
             PUSH_MARGV_FORMAT(@"-Dmetallum.ios.view.pointer=%p", surfaceView);
-            PUSH_MARGV_FORMAT(@"-Dmetallum.ios.screen.scale=%g", (double)UIScreen.mainScreen.scale);
-            NSLog(@"[JavaLauncher] Published Metallum surface view: %p (scale=%g)", surfaceView, (double)UIScreen.mainScreen.scale);
+            PUSH_MARGV_FORMAT(@"-Dmetallum.ios.screen.scale=%g", amethystPublishedScale);
+            NSLog(@"[JavaLauncher] Published Metallum surface view: %p (scale=%g = device %g x resolution %g)",
+                  surfaceView, amethystPublishedScale, (double)UIScreen.mainScreen.scale, (double)resolutionScale);
         } else {
             NSLog(@"[JavaLauncher] Warning: +[SurfaceViewController surface] returned nil, Metallum will fall back to ObjC runtime lookup");
         }

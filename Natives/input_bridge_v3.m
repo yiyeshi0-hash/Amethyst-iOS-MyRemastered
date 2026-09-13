@@ -429,7 +429,11 @@ void CallbackBridge_nativeSetInputReady(BOOL inputReady) {
             GLFW_invoke_FramebufferSize((void*) showingWindow, windowWidth, windowHeight);
         }
         if (GLFW_invoke_WindowSize) {
-            GLFW_invoke_FramebufferSize((void*) showingWindow, windowWidth, windowHeight);
+            // 修: 这里原本误写成 GLFW_invoke_FramebufferSize —— 守卫查的是 WindowSize
+            // 却调用了 FramebufferSize。当 FramebufferSize 尚未注册(NULL, 例如窗口/场景
+            // 初始化被中断: UISceneErrorDomain Code=101)而 WindowSize 已注册时, 守卫放行,
+            // 于是跳到 0 执行 -> SIGSEGV at pc=0x0 (nativeSetInputReady+0xd8)。
+            GLFW_invoke_WindowSize((void*) showingWindow, windowWidth, windowHeight);
         }
     }
 }

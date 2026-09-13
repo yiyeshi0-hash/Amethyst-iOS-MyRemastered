@@ -183,7 +183,11 @@
     [ControllerInput tick];
     // 动态判定：仅当 MC 真实走 Vulkan 路径时才递增 FPS 计数器
     BOOL actualVulkanPath = pojavIsActualVulkanPath();
-    if (actualVulkanPath) {
+    // Metal (metallum) 渲染器同样不经过 EGL 的 pojavSwapBuffers 路径(也不走
+    // MoltenVK 的 vkQueuePresentKHR)，因此首帧只能由 displayLink 检测；
+    // 否则 PojavFirstFrameRendered 永不发出，启动遮罩不会自动撤除。
+    BOOL metalPath = (getenv("AMETHYST_METAL") != NULL);
+    if (actualVulkanPath || metalPath) {
         pojavIncrementFpsCounter();
     }
     _tickCount++;
@@ -1754,8 +1758,185 @@ static GameSurfaceView* pojavWindow;
     return touch == nil || touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled;
 }
 
+// ============================================================================
+// 26.3: 把 launcher 收到的触摸同步注入 SDL3 事件队列。
+//
+// 背景: MC 26.3 起输入改用 SDL3(SDLEventHandler 只监听
+// SDL_MouseMotionEvent / SDL_MouseButtonEvent / SDL_KeyboardEvent),
+// 而 launcher 原有的注入路径是 Caciocavallo(AWT)事件 + 定制 GLFW native 桩,
+// 26.3 完全不读 -> 表现为有画面有声、但戳屏幕没反应。
+//
+// 做法: 在触摸回调里把同一份触摸转成 SDL 事件推入队列。窗口句柄用
+// SDL_GetWindows() 取(SDL 事件队列是全局的, 不需要 launcher 自己建窗口)。
+//
+// SDL3 事件布局(注意 timestamp 是 SDL3 新增的 8 字节, 少了它会整段错位):
+//   type(u32@0) reserved(u32@4) timestamp(u64@8) windowID(u32@16) which(u32@20)
+//   motion: state(u32@24) x(f32@28) y(f32@32) xrel(f32@36) yrel(f32@40)
+//   button: button(u8@24) down(u8@25) clicks(u8@26) pad(u8@27) x(f32@28) y(f32@32)
+// ============================================================================
+static void AmethystInjectSdlTouch(double px, double py, int phase)
+{
+    // phase: 0=MOVE 1=DOWN 2=UP
+    static void *sdlHandle = NULL;
+    static int (*pPushEvent)(void *) = NULL;
+    static void *(*pGetWindows)(int *) = NULL;
+    static unsigned int (*pGetWindowID)(void *) = NULL;
+    static int (*pGetSizePixels)(void *, int *, int *) = NULL;
+    static int (*pGetSize)(void *, int *, int *) = NULL;
+    static int (*pGetPos)(void *, int *, int *) = NULL;
+    static void (*pWarpMouse)(void *, float, float) = NULL;
+    static unsigned int (*pGetMouseState)(float *, float *) = NULL;
+    static int logged = 0;
+
+    if (sdlHandle == NULL) {
+        sdlHandle = dlopen("libSDL3.dylib", RTLD_NOW | RTLD_GLOBAL);
+        if (sdlHandle == NULL) {
+            sdlHandle = dlopen("@rpath/libSDL3.dylib", RTLD_NOW | RTLD_GLOBAL);
+        }
+        if (sdlHandle == NULL) {
+            if (!logged) { logged = 1; NSLog(@"[AmethystTouch] libSDL3.dylib not loadable"); }
+            return;
+        }
+        pPushEvent = (int (*)(void *))dlsym(sdlHandle, "SDL_PushEvent");
+        pGetWindows = (void *(*)(int *))dlsym(sdlHandle, "SDL_GetWindows");
+        pGetWindowID = (unsigned int (*)(void *))dlsym(sdlHandle, "SDL_GetWindowID");
+        pGetSizePixels = (int (*)(void *, int *, int *))dlsym(sdlHandle, "SDL_GetWindowSizeInPixels");
+        pGetSize = (int (*)(void *, int *, int *))dlsym(sdlHandle, "SDL_GetWindowSize");
+        pGetPos = (int (*)(void *, int *, int *))dlsym(sdlHandle, "SDL_GetWindowPosition");
+        pWarpMouse = (void (*)(void *, float, float))dlsym(sdlHandle, "SDL_WarpMouseInWindow");
+        pGetMouseState = (unsigned int (*)(float *, float *))dlsym(sdlHandle, "SDL_GetMouseState");
+        if (!logged) {
+            logged = 1;
+            NSLog(@"[AmethystTouch] SDL3 ready push=%p windows=%p id=%p",
+                  pPushEvent, pGetWindows, pGetWindowID);
+        }
+    }
+    if (pPushEvent == NULL || pGetWindows == NULL) {
+        return;
+    }
+
+    int winCount = 0;
+    void **windows = (void **)pGetWindows(&winCount);
+    if (windows == NULL || winCount <= 0) {
+        static int noWinLogged = 0;
+        if (noWinLogged++ < 3) {
+            NSLog(@"[AmethystTouch] phase=%d pos=(%.0f,%.0f) -> SDL_GetWindows returned %d",
+                  phase, px, py, winCount);
+        }
+        return;
+    }
+    unsigned int windowId = pGetWindowID ? pGetWindowID(windows[0]) : 0;
+
+    // 诊断日志(限频): 每次触摸的目标窗口/坐标/push 结果
+    static int diagTick = 0;
+    const int wantLog = (diagTick++ % 20 == 0);
+    if (wantLog) {
+        int ww = 0, wh = 0;
+        static void (*pGetWindowSize)(void *, int *, int *) = NULL;
+        if (pGetWindowSize == NULL) {
+            pGetWindowSize = (void (*)(void *, int *, int *))dlsym(sdlHandle, "SDL_GetWindowSizeInPixels");
+        }
+        if (pGetWindowSize) {
+            pGetWindowSize(windows[0], &ww, &wh);
+        }
+        NSLog(@"[AmethystTouch] phase=%d pos=(%.0f,%.0f) wins=%d wid=%u win=%p px=(%dx%d)",
+              phase, px, py, winCount, windowId, windows[0], ww, wh);
+    }
+
+    unsigned char ev[64];
+
+    // 单位换算(关键): launcher 给的是"点"(如 874x402), 而 Minecraft 的
+    // Window.getWidth() 返回"像素"(2622x1206) —— 它算 GUI 坐标用的是
+    //   scaledX = xpos * guiScaledWidth / window.getWidth()
+    // 不换算的话 xpos 会被当成像素, 结果偏小 density 倍(实测偏 3 倍、点击全落到左上角)。
+    // 这里按窗口自身的 像素/点 密度换算, 不写死数值。
+    float density = 1.0f;
+    if (pGetSizePixels && pGetSize) {
+        int pw = 0, ph = 0, lw = 0, lh = 0;
+        pGetSizePixels(windows[0], &pw, &ph);
+        pGetSize(windows[0], &lw, &lh);
+        if (lw > 0 && pw > 0) {
+            density = (float)pw / (float)lw;
+        }
+        // [AMETHYST-FIX] 推给游戏的坐标必须落在「游戏自己的窗口空间」里, 而不是 SDL 的像素空间。
+        // 游戏窗口尺寸 = windowWidth = physicalWidth * resolutionScale (视频分辨率选项, 150% => 3932),
+        // 而 SDL 窗口的像素尺寸只有 physicalWidth * UIScreen.scale (2622) —— 两者相差 resolutionScale。
+        // 若不校正, 游戏按 3932 解释我们按 2622 推的坐标 => 整体缩小 0.667 (悬停/点击偏左上 1/3)。
+        // 这里与 JavaLauncher 公布的 metallum.ios.screen.scale 用同一个公式, 保证两侧一致。
+        {
+            SurfaceViewController *vcD = [SurfaceViewController currentInstance];
+            if (vcD != nil) {
+                const CGFloat amethystGameScale = vcD.screenScale * (resolutionScale > 0.0f ? (CGFloat)resolutionScale : 1.0);
+                if (amethystGameScale > 0.0) {
+                    density = (float)amethystGameScale;
+                }
+            }
+        }
+    }
+    const float fx = (float)(px * density);
+    const float fy = (float)(py * density);
+
+    // 拖动镜头用的增量(相对上一次触点)
+    static float prevX = -1.0f;
+    static float prevY = -1.0f;
+    float xrel = 0.0f;
+    float yrel = 0.0f;
+    if (prevX >= 0.0f) {
+        xrel = fx - prevX;
+        yrel = fy - prevY;
+    }
+    prevX = fx;
+    prevY = fy;
+
+    // 关键修正: MouseHandler.onButton(handle, MouseButtonInfo, down) 的参数里没有坐标,
+    // 它用 getScaledXPos/getScaledYPos 读内部 xpos/ypos, 而那对坐标只在 onMove
+    // (鼠标移动事件)里更新。轻点只产生 DOWN/UP、没有 MOVE —— 若不在按钮之前补一条
+    // 同坐标的 motion, xpos/ypos 会停在 (0,0), 点击全部落到左上角(表现就是戳屏幕没反应)。
+    // 关键修正(2): 必须让 SDL 的【内部指针状态】跟着手指走。
+    // MC 的光标有两个来源: 我们推的 SDL 事件, 以及 MouseHandler.resyncMousePosition()
+    // —— 后者被 Gui.setScreen()(每次换界面)和 Minecraft.resizeGui() 调用, 它会用
+    // SDL_GetMouseState() 的值覆盖 xpos/ypos。而 SDL_PushEvent 不会更新 SDL 的内部
+    // 指针状态, 于是换界面之后光标被拉回 SDL 认为的位置(而且那是"点"坐标, 不是 MC
+    // 用的像素坐标)。表现就是: 按钮点得中, 但悬停高亮/光标跑到十万八千里外。
+    // SDL_WarpMouseInWindow 会同时更新内部状态并投递一条正规 MOTION 事件, 这里用与
+    // 我们推送一致的像素坐标喂它, 让 SDL 与 MC 的认知统一。
+    if (pWarpMouse != NULL) {
+        pWarpMouse(windows[0], fx, fy);
+    }
+
+    memset(ev, 0, sizeof(ev));
+    *(unsigned int *)(ev + 0) = 0x400;   // SDL_EVENT_MOUSE_MOTION(先把光标摆到触点)
+    *(unsigned int *)(ev + 16) = windowId;
+    *(unsigned int *)(ev + 20) = 1;
+    *(float *)(ev + 28) = fx;
+    *(float *)(ev + 32) = fy;
+    *(float *)(ev + 36) = xrel;
+    *(float *)(ev + 40) = yrel;
+    const int rcMove = pPushEvent(ev);
+
+    int rcButton = -1;
+    if (phase != 0) {
+        memset(ev, 0, sizeof(ev));
+        *(unsigned int *)(ev + 0) = (phase == 1) ? 0x401 : 0x402;  // BUTTON_DOWN / BUTTON_UP
+        *(unsigned int *)(ev + 16) = windowId;
+        *(unsigned int *)(ev + 20) = 1;
+        *(unsigned char *)(ev + 24) = 1;                        // 左键
+        *(unsigned char *)(ev + 25) = (phase == 1) ? 1 : 0;     // down
+        *(unsigned char *)(ev + 26) = 1;                        // clicks
+        *(float *)(ev + 28) = fx;
+        *(float *)(ev + 32) = fy;
+        rcButton = pPushEvent(ev);
+    }
+}
+
+
 - (void)sendTouchPoint:(CGPoint)location withEvent:(int)event
 {
+    // 26.3: 同步把触摸注入 SDL 事件队列(见 AmethystInjectSdlTouch 说明)。
+    // 原有 AWT/GLFW 注入路径保留, 供 26.2 及更早版本使用。
+    const int amethystTouchPhase = (event == ACTION_DOWN) ? 1 : ((event == ACTION_UP) ? 2 : 0);
+    AmethystInjectSdlTouch(location.x, location.y, amethystTouchPhase);
+
     CGFloat screenScale = self.screenScale;
     if (!isGrabbing) {
         screenScale *= resolutionScale;
