@@ -23,6 +23,7 @@ jobs:
       - name: evidence
         working-directory: intentprobe
         run: |
+          exec > >(tee -a build.log) 2>&1
           echo "########## A. const/gather 相关参数 ##########"
           grep -o -- "-emit-const-values[^ ]*" build.log | head -3 || true
           grep -o -- "-const-gather-protocols-file" build.log | head -3 || true
@@ -30,6 +31,7 @@ jobs:
           grep -o -- "/Users/runner/[^ \"']*" build.log | grep -i -E "gather|protocol|const" | sort -u | head -10 || true
           echo "########## C. 该文件内容 ##########"
           for p in $(grep -o -- "/Users/runner/[^ \"']*" build.log | grep -i -E "gather|protocol|const" | sort -u | head -5); do
+            echo "=== CAT $p ==="
             echo "--- $p ---"
             cat "$p" 2>/dev/null | head -80 || true
             echo
@@ -44,8 +46,15 @@ jobs:
           for f in $(find ~/Library/Developer/Xcode/DerivedData -name extract.actionsdata 2>/dev/null | head -1); do
             echo "--- $f ($(wc -c < "$f") B) ---"; head -c 2500 "$f"; echo
           done
-          echo "########## F. 完整编译行 ##########"
-          grep -m1 "swift-frontend -frontend -c" build.log | tr ' ' '\n' | grep -n -E "const|gather|emit" | head -20 || true
+          echo "########## F. 协议清单 JSON 内容(直接从 DerivedData 找) ##########"
+          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "*_const_extract_protocols.json" 2>/dev/null | head -3); do
+            echo "=== $f ($(wc -c < "$f") B) ==="; cat "$f"; echo
+          done
+          echo "########## G. swiftconstvalues ##########"
+          find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" 2>/dev/null | head -3
+          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "*.swiftconstvalues" 2>/dev/null | head -1); do echo "=== $f ==="; cat "$f"; echo; done
+          echo "########## H. actionsdata ##########"
+          for f in $(find ~/Library/Developer/Xcode/DerivedData -name "extract.actionsdata" 2>/dev/null | head -1); do echo "=== $f ==="; cat "$f"; echo; done
           echo "########## G. 处理器调用 ##########"
           grep -o "appintentsmetadataprocessor.\{0,900\}" build.log | head -1 || true
       - uses: actions/upload-artifact@v4
