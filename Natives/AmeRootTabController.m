@@ -21,6 +21,51 @@ NSString * const AmeTabTappedNotification = @"AmeTabTapped";   // ★ [ROOTTAB]
 @interface AmeRootTabController () <UITabBarControllerDelegate>   // ★ 声明协议,消掉 delegate 赋值警告
 @end
 
+#pragma mark - ★ [TAB-OVERLAP] 零时长标签过渡(保证任一时刻只有一个页面视图)
+
+/// ★ [TAB-OVERLAP] 让 UIKit 的标签切换【瞬时完成】,不做交叉淡入淡出。
+/// 背景:系统默认的标签过渡是“容器快照淡入淡出”——过渡期间 from 页与 to 页同时存在。
+/// 用户“连续快速点不同底栏按钮”时,前一次的过渡还没收尾、后一次已经叠上,
+/// 于是两屏快照同时留在容器里 ⇒ 看到的就是“画面重叠 / 残影”。
+/// 这里返回一个 0 时长的过渡器:旧页立刻移除、新页立刻挂上、随即 completeTransition,
+/// 结构上任何时刻只有一个页面视图 ⇒ 连点也不可能重叠。
+/// 只用公开 API;不动选中态、不动页面生命周期、不禁点。
+@interface AmeTabInstantAnimator : NSObject <UIViewControllerAnimatedTransitioning>
+@end
+
+@implementation AmeTabInstantAnimator
+
+- (NSTimeInterval)transitionDuration:(nullable id<UIViewControllerContextTransitioning>)transitionContext {
+    return 0.0;
+}
+
+- (void)animateTransition:(id<UIViewControllerContextTransitioning>)transitionContext {
+    UIView *container = transitionContext.containerView;
+    UIViewController *fromVC = [transitionContext viewControllerForKey:UITransitionContextFromViewControllerKey];
+    UIViewController *toVC   = [transitionContext viewControllerForKey:UITransitionContextToViewControllerKey];
+
+    UIView *toView   = [transitionContext viewForKey:UITransitionContextToViewKey]   ?: (toVC ? toVC.view : nil);
+    UIView *fromView = [transitionContext viewForKey:UITransitionContextFromViewKey] ?: (fromVC ? fromVC.view : nil);
+
+    if (toView) {
+        toView.frame = [transitionContext finalFrameForViewController:toVC];
+        toView.alpha = 1.0;
+        [container addSubview:toView];
+    }
+    if (fromView && fromView.superview == container) {
+        [fromView removeFromSuperview];    // ★ 关键:旧页立刻撤,不留快照 ⇒ 不可能重叠
+    }
+    // 标签栏本身也是容器的兄弟视图:新页加到最上层后把它抬回来,别被内容盖住。
+    for (UIView *sv in container.subviews) {
+        if ([sv isKindOfClass:[UITabBar class]]) {
+            [container bringSubviewToFront:sv];
+        }
+    }
+    [transitionContext completeTransition:YES];
+}
+
+@end
+
 @implementation AmeRootTabController
 
 /// 页面统一包进导航控制器:页面里若自己 push/present 也能正常工作
@@ -91,6 +136,16 @@ static UIViewController *AmeWrapInNav(UIViewController *vc) {
     [[NSNotificationCenter defaultCenter] postNotificationName:AmeTabTappedNotification
                                                        object:nil
                                                      userInfo:@{@"index": @(idx)}];
+}
+
+#pragma mark - ★ [TAB-OVERLAP] 底栏切换过渡
+
+/// ★ [TAB-OVERLAP] 标签切换用 0 时长过渡(见 AmeTabInstantAnimator):
+/// 连点底栏不同按钮时不再有“上一张快照未撤、下一张已上”的窗口 ⇒ 不重叠。
+- (id<UIViewControllerAnimatedTransitioning>)tabBarController:(UITabBarController *)tabBarController
+        animationControllerForTransitionFromViewController:(UIViewController *)fromViewController
+                                          toViewController:(UIViewController *)toViewController {
+    return [[AmeTabInstantAnimator alloc] init];
 }
 
 @end

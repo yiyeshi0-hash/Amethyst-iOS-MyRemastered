@@ -957,9 +957,20 @@ static const CGFloat kPortraitCardCorner      = 16.0;   // 竖屏底部卡圆角
 - (void)setContentViewController:(UIViewController *)viewController animated:(BOOL)animated {
     if (!viewController) return;
 
-    // 关键修复（UI 累积异常）：同一实例直接跳过，避免对同一 VC 重复添加约束
-    // 和反复调用 applyEffectToNavigationBar: 导致 hairline UIImageView 累积。
-    if (viewController == _contentViewController) return;
+    // ★ [TAB-OVERLAP] 同一实例直接跳过(避免重复加约束 / hairline 累积)。
+    //   但必须保证它此刻真的挂在容器上并且完全可见 —— 上一次切换的淡入动画可能还没走完
+    //   (alpha < 1),直接 return 会把"半透明 / 没挂上"的状态留在屏幕上。
+    if (viewController == _contentViewController) {
+        if (viewController.view.superview != self.contentContainer) {
+            viewController.view.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.contentContainer addSubview:viewController.view];
+            if (self.currentContentConstraints.count > 0) {
+                [NSLayoutConstraint activateConstraints:self.currentContentConstraints];
+            }
+        }
+        viewController.view.alpha = 1.0;
+        return;
+    }
 
     // 检查是否切换到非编辑器页面
     if (![viewController isKindOfClass:[UINavigationController class]] ||
@@ -968,31 +979,40 @@ static const CGFloat kPortraitCardCorner      = 16.0;   // 竖屏底部卡圆角
         self.profileEditorVC = nil;
     }
 
+    // ★ [TAB-OVERLAP] ① 先把"上一次切换"彻底收尾,再进入本次切换。
+    //   原实现把 removeFromSuperview / removeFromParentViewController 放进 transitionWithView:
+    //   的 completion 里 —— 连点时第二次切换会先于第一次的 completion 执行,
+    //   于是"旧视图还挂在容器里(等 completion 才撤),新视图已经加上" ⇒ 两屏共存 = 画面重叠。
+    //   现在改成【同步】收尾:任何时刻容器里至多一个内容视图。
     UIViewController *oldVC = _contentViewController;
+    if (oldVC) {
+        [oldVC willMoveToParentViewController:nil];
+        [oldVC.view removeFromSuperview];
+        [oldVC removeFromParentViewController];
+    }
 
-    // 移除旧的 + 添加新的
     _contentViewController = viewController;
     [self addChildViewController:viewController];
     viewController.view.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // FCL 风格：对 UINavigationController 应用 nav bar 毛玻璃效果，并对内容 VC 透明化处理，
-    // 避免顶部出现默认白色 nav bar 形成"大白条"，同时与两侧深色毛玻璃面板视觉一致。
+    // FCL 风格:对 UINavigationController 应用 nav bar 毛玻璃效果,并对内容 VC 透明化处理,
+    // 避免顶部出现默认白色 nav bar 形成"大白条",同时与两侧深色毛玻璃面板视觉一致。
     if ([viewController isKindOfClass:[UINavigationController class]]) {
         UINavigationController *nav = (UINavigationController *)viewController;
         nav.delegate = self;
         [[BackgroundManager sharedManager] applyEffectToNavigationBar:nav.navigationBar];
-        // 透明化 topViewController，让背景透出 nav bar 毛玻璃
+        // 透明化 topViewController,让背景透出 nav bar 毛玻璃
         [[BackgroundManager sharedManager] makeViewControllerTransparent:nav.topViewController];
-        // 透明化 nav 栈中所有已存在的 VC（防止前一个页面透出残留）
+        // 透明化 nav 栈中所有已存在的 VC(防止前一个页面透出残留)
         for (UIViewController *stackVC in nav.viewControllers) {
             [[BackgroundManager sharedManager] makeViewControllerTransparent:stackVC];
         }
     } else {
-        // 非导航控制器包装的 VC 也透明化，确保与背景融合
+        // 非导航控制器包装的 VC 也透明化,确保与背景融合
         [[BackgroundManager sharedManager] makeViewControllerTransparent:viewController];
     }
 
-    // 关键修复（UI 累积异常）：deactivate 旧约束，避免在 tmpRootVC 保留场景下
+    // 关键修复(UI 累积异常):deactivate 旧约束,避免在 tmpRootVC 保留场景下
     // 缓存复用的子 VC 反复激活约束导致 contentContainer 内容区左右变宽。
     if (self.currentContentConstraints.count > 0) {
         [NSLayoutConstraint deactivateConstraints:self.currentContentConstraints];
@@ -1006,43 +1026,29 @@ static const CGFloat kPortraitCardCorner      = 16.0;   // 竖屏底部卡圆角
         [viewController.view.bottomAnchor constraintEqualToAnchor:self.contentContainer.bottomAnchor]
     ];
 
-    if (animated && oldVC) {
-        // 修复问题5：原实现用两个独立的 UIView transitionWithView:（一个移除旧视图、一个添加新视图），
-        // 两个 crossDissolve 同时作用于 contentContainer 会导致视觉冲突和残影（旧画面未完全消失就覆盖新界面）。
-        // 改为单个 transition：在同一个 animations block 内完成"移除旧视图 + 添加新视图"，
-        // crossDissolve 会正确抓取前后快照做交叉渐变，completion 中清理旧 VC 父子关系。
-        //
-        // 关键修复（入场动画从左上角弹出）：UIKit 在 animations block 返回后立即对容器做 snapshot，
-        // 此时新视图虽然已 addSubview + activateConstraints，但尚未经历 layout pass，frame 仍是
-        // (0,0,0,0)。配合 contentContainer 子视图（contentCard）的 masksToBounds+圆角裁剪，
-        // crossDissolve 渐变呈现"从左上角小点扩展出来"的怪异效果。
-        // 在 animations block 内显式 layoutIfNeeded 强制立即布局，让 snapshot B 时 frame 已撑满，
-        // crossDissolve 就是标准的淡入淡出。duration 由 0.25 调整为 0.3 让过渡更柔和自然。
-        [UIView transitionWithView:self.contentContainer
-                          duration:0.3
-                           options:UIViewAnimationOptionTransitionCrossDissolve
-                        animations:^{
-                            [oldVC willMoveToParentViewController:nil];
-                            [oldVC.view removeFromSuperview];
-                            [self.contentContainer addSubview:viewController.view];
-                            [NSLayoutConstraint activateConstraints:newConstraints];
-                            [self.contentContainer layoutIfNeeded];
-                        } completion:^(BOOL finished) {
-                            [oldVC removeFromParentViewController];
-                            [viewController didMoveToParentViewController:self];
-                        }];
-    } else {
-        if (oldVC) {
-            [oldVC willMoveToParentViewController:nil];
-            [oldVC.view removeFromSuperview];
-            [oldVC removeFromParentViewController];
-        }
-        [self.contentContainer addSubview:viewController.view];
-        [NSLayoutConstraint activateConstraints:newConstraints];
-        [viewController didMoveToParentViewController:self];
-    }
-
+    // ★ [TAB-OVERLAP] ② 结构切换【同步】完成:上面的旧视图移除 + 这里的挂载/约束/布局一次做完。
+    //   刻意不再用 [UIView transitionWithView:]:它会对整个容器抓快照,连点时上一张快照还留在
+    //   容器里(要等 0.3s 动画结束才被撤),和这一次叠在一起就是用户看到的"画面重叠 / 残影"。
+    //   改成只对【新视图自身】做 alpha 淡入 ⇒ 结构上永远只有一个内容视图,快照无处可叠。
+    viewController.view.alpha = (animated && oldVC) ? 0.0 : 1.0;
+    [self.contentContainer addSubview:viewController.view];
+    [NSLayoutConstraint activateConstraints:newConstraints];
+    [self.contentContainer layoutIfNeeded];   // 先布局到位再淡入(否则会从左上角 0x0 小点扩展出来)
+    [viewController didMoveToParentViewController:self];
     self.currentContentConstraints = newConstraints;
+
+    // ★ [TAB-OVERLAP] ③ 只淡入新视图;AllowUserInteraction ⇒ 动画期间照常可点(不禁点、不卡手)。
+    //   连点时长的那次淡入会被下一次切换立刻打断(旧视图被同步摘掉),不会留下任何残影。
+    if (animated && oldVC) {
+        [UIView animateWithDuration:0.22
+                              delay:0.0
+                            options:(UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionAllowUserInteraction | UIViewAnimationOptionBeginFromCurrentState)
+                         animations:^{
+            viewController.view.alpha = 1.0;
+        } completion:nil];
+    } else {
+        viewController.view.alpha = 1.0;
+    }
 }
 
 #pragma mark - Orientation
