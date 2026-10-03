@@ -18,6 +18,8 @@
 
 @property(nonatomic, strong) NSMutableArray *accountList;
 @property(nonatomic) ASWebAuthenticationSession *authVC;
+// ★ [ADDBTN-INSET] 底部「添加账户」按钮的底边约束:单独持有,交由布局期按【实际遮挡量】调整。
+@property(nonatomic, strong) NSLayoutConstraint *ameAddAccountBottomConstraint;
 
 @end
 
@@ -108,6 +110,46 @@
     [self ameAccountEnsureBackItemIfNeeded];
 }
 
+#pragma mark - ★ [ADDBTN-INSET] 底部「添加账户」按钮避开底栏
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [self ame_updateAddAccountButtonInset];
+}
+
+- (void)viewSafeAreaInsetsDidChange {
+    [super viewSafeAreaInsetsDidChange];
+    [self ame_updateAddAccountButtonInset];
+}
+
+/// 把按钮顶到底栏之上:inset = max(自身 safeArea 底, 底栏与本页底部的【实际重叠】高度)。
+///   这样在"有/无底栏、底栏显示/隐藏、横竖屏、底栏半透明与否"下都成立;
+///   找不到底栏时退化为 safeAreaInsets.bottom(与系统一致)。
+- (void)ame_updateAddAccountButtonInset {
+    if (!self.ameAddAccountBottomConstraint) { return; }
+
+    CGFloat inset = self.view.safeAreaInsets.bottom;
+
+    UITabBarController *tbc = self.tabBarController;
+    if (!tbc) {
+        // 本页挂在主页的「内容容器」里,不一定是 tabBarController 的直接子 VC ⇒ 再往上找一层
+        UIViewController *root = self.view.window.rootViewController;
+        if ([root isKindOfClass:[UITabBarController class]]) {
+            tbc = (UITabBarController *)root;
+        }
+    }
+    UIView *bar = tbc.tabBar;
+    if (tbc && bar && !bar.hidden && bar.window) {
+        CGRect barRect = [self.view convertRect:bar.bounds fromView:bar];
+        CGFloat overlap = CGRectGetMaxY(self.view.bounds) - CGRectGetMinY(barRect);
+        // 只在"确实被压住"且量值合理时采纳(防异常值)
+        if (overlap > 0 && overlap < CGRectGetHeight(self.view.bounds) * 0.5) {
+            inset = MAX(inset, overlap);
+        }
+    }
+    self.ameAddAccountBottomConstraint.constant = -(inset + 16.0);
+}
+
 /// ★ [ACCOUNTBACK] 见 viewWillAppear 注释。
 - (void)ameAccountEnsureBackItemIfNeeded {
     UINavigationController *nav = self.navigationController;
@@ -186,13 +228,19 @@
     [self.view addSubview:addBtn];
     // 使用 frameLayoutGuide（UITableView 的可见区域锚点）而非 safeAreaLayoutGuide，
     // 确保按钮随可见区域底部浮动，不会跟随 cell 滚动
+    // ★ [ADDBTN-INSET] 底边约束【单独持有】:底栏(UITabBarController 的 tabBar)是半透明悬浮的,
+    //   本页内容区延伸到底栏之下 ⇒ 写死 -16 会让按钮被底栏压住(用户实测:新旧系统都被挡)。
+    //   改为交给 ame_updateAddAccountButtonInset 按实际遮挡量设置 constant。
+    self.ameAddAccountBottomConstraint =
+        [addBtn.bottomAnchor constraintEqualToAnchor:self.tableView.frameLayoutGuide.bottomAnchor constant:-16];
     [NSLayoutConstraint activateConstraints:@[
-        [addBtn.bottomAnchor constraintEqualToAnchor:self.tableView.frameLayoutGuide.bottomAnchor constant:-16],
+        self.ameAddAccountBottomConstraint,
         [addBtn.centerXAnchor constraintEqualToAnchor:self.tableView.frameLayoutGuide.centerXAnchor],
         [addBtn.heightAnchor constraintEqualToConstant:48],
         [addBtn.widthAnchor constraintGreaterThanOrEqualToConstant:160]
     ]];
     self.addAccountButton = addBtn;
+    [self ame_updateAddAccountButtonInset];
 }
 
 - (void)addAccountTapped {
