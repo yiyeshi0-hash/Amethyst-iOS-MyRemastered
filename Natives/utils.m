@@ -574,30 +574,88 @@ BOOL AMEJITHasGetTaskAllow(void) {
 // 配对文件推荐位置(INTEGRATION.md「Store and import the pairing file」):
 //   Documents/StikJIT/pairingFile.plist
 // Info.plist 已置 UIFileSharingEnabled=true,用户可经 Finder/AFC 拷入。
-NSString *AMEJITPairingFilePath(void) {
+// ★ [JIT-PAIRING] 配对文件在实战里会放在不同位置(用户按不同教程导入的):
+//   以前只认 Documents/StikJIT/pairingFile.plist 一条 ⇒ 明明装了也报 pairing=NO
+//   (用户实测:日志说"没装",但他确实装了)。故改为【多候选】逐个查,并记住命中的那条。
+static NSString *gAmeJITPairingFoundPath = nil;
+
+NSArray<NSString *> *AMEJITPairingFileCandidates(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
     NSURL *documents = [NSFileManager.defaultManager
         URLForDirectory:NSDocumentDirectory inDomain:NSUserDomainMask
        appropriateForURL:nil create:YES error:nil];
-    if (!documents) {
-        return nil;
+    NSURL *support = [NSFileManager.defaultManager
+        URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask
+       appropriateForURL:nil create:YES error:nil];
+    if (documents) {
+        NSArray<NSString *> *subs = @[@"StikJIT", @"StikDebug", @"pairing", @""];
+        NSArray<NSString *> *names = @[@"pairingFile.plist", @"pairingFile",
+                                       @"mobiledevicepairing.plist", @"pairing_record.plist"];
+        for (NSString *sub in subs) {
+            NSURL *dir = sub.length ? [documents URLByAppendingPathComponent:sub isDirectory:YES] : documents;
+            for (NSString *n in names) {
+                [out addObject:[[dir URLByAppendingPathComponent:n] path]];
+            }
+        }
     }
-    NSURL *dir = [documents URLByAppendingPathComponent:@"StikJIT" isDirectory:YES];
-    return [[dir URLByAppendingPathComponent:@"pairingFile.plist"] path];
+    if (support) {
+        for (NSString *sub in @[@"StikJIT", @"StikDebug", @""]) {
+            NSURL *dir = sub.length ? [support URLByAppendingPathComponent:sub isDirectory:YES] : support;
+            [out addObject:[[dir URLByAppendingPathComponent:@"pairingFile.plist"] path]];
+        }
+    }
+    return out;
+}
+
+/// 返回【实际存在】的配对文件路径;都没有则返回推荐路径(供日志展示“应该放哪”)。
+NSString *AMEJITPairingFilePath(void) {
+    if (gAmeJITPairingFoundPath && [NSFileManager.defaultManager fileExistsAtPath:gAmeJITPairingFoundPath]) {
+        return gAmeJITPairingFoundPath;
+    }
+    for (NSString *p in AMEJITPairingFileCandidates()) {
+        if ([NSFileManager.defaultManager fileExistsAtPath:p]) {
+            gAmeJITPairingFoundPath = p;
+            return p;
+        }
+    }
+    return AMEJITPairingFileCandidates().firstObject;
 }
 
 BOOL AMEJITHasPairingFile(void) {
-    NSString *path = AMEJITPairingFilePath();
-    return path.length > 0 && [NSFileManager.defaultManager fileExistsAtPath:path];
+    for (NSString *p in AMEJITPairingFileCandidates()) {
+        if ([NSFileManager.defaultManager fileExistsAtPath:p]) {
+            gAmeJITPairingFoundPath = p;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// ★ [JIT-PAIRING] 单独探测“使能工具是否已装”——用 URL scheme 探,与配对文件无关。
+///   避免把“没找到配对文件”误读成“工具没装”。
+BOOL AMEJITEnablerAppInstalled(void) {
+    NSArray<NSString *> *schemes = @[@"stikdebug", @"stikjit", @"sidestore", @"stosdebug"];
+    for (NSString *sc in schemes) {
+        NSURL *u = [NSURL URLWithString:[sc stringByAppendingString:@"://"]];
+        if (u && [[UIApplication sharedApplication] canOpenURL:u]) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 // 在一次 JIT 获取动作前把门禁状态打到日志(只读,无副作用)。
 void AMEJITLogPocketJReadiness(NSString *context) {
-    NSLog(@"[JIT] [POCKETJ-JIT] readiness(%@): ios17_4=%@ get-task-allow=%@ pairing=%@ path=%@",
+    BOOL hasPairing = AMEJITHasPairingFile();
+    NSLog(@"[JIT] [POCKETJ-JIT] readiness(%@): ios17_4=%@ get-task-allow=%@ "
+          @"enabler-app-installed=%@ pairing-file=%@ found=%@ (推荐位置=%@)",
           context ?: @"?",
           AMEJITDeviceSupportsBuiltInStikJIT() ? @"YES" : @"NO",
           AMEJITHasGetTaskAllow() ? @"YES" : @"NO",
-          AMEJITHasPairingFile() ? @"YES" : @"NO",
-          AMEJITPairingFilePath() ?: @"(nil)");
+          AMEJITEnablerAppInstalled() ? @"YES" : @"NO",
+          hasPairing ? @"YES" : @"NO",
+          hasPairing ? (AMEJITPairingFilePath() ?: @"(?)") : @"(未找到,已试多路径)",
+          AMEJITPairingFileCandidates().firstObject ?: @"(nil)");
 }
 
 #ifndef P_TRACED

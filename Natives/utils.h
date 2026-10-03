@@ -168,7 +168,10 @@ BOOL JIT26DetachSafe(void);
 //   本仓库暂未接入 Helper 扩展,以下仅用于检测/日志/UI 提示,不做自附加调试器。
 BOOL AMEJITDeviceSupportsBuiltInStikJIT(void);
 BOOL AMEJITHasGetTaskAllow(void);
-NSString *AMEJITPairingFilePath(void);   // Documents/StikJIT/pairingFile.plist
+NSString *AMEJITPairingFilePath(void);
+// ★ [JIT-PAIRING] 多候选路径 + 工具是否已装(与配对文件解耦)
+NSArray<NSString *> *AMEJITPairingFileCandidates(void);
+BOOL AMEJITEnablerAppInstalled(void);   // Documents/StikJIT/pairingFile.plist
 BOOL AMEJITHasPairingFile(void);
 void AMEJITLogPocketJReadiness(NSString *context);
 // same as JIT26PrepareRegion, but used for smaller memory regions
