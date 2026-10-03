@@ -803,6 +803,58 @@ NSInteger ame98_mcMajorFromVersionId(NSString *versionId) {
     return 0;
 }
 
+// ★ [METALLUM-264] 从任意形态的版本 ID 提取 26.x 的次版本号（"26.<minor>"）。
+// 口径与 metallum agent 的 mc26Minor() 完全一致：定位 "26." 后的连续数字。
+// 非 26.x / 无法解析返回 -1。用于 metallum 版本家族路由（见下）。
+static NSInteger ame98_mcMinorFromVersionId(NSString *versionId) {
+    if (![versionId isKindOfClass:[NSString class]] || versionId.length == 0) {
+        return -1;
+    }
+    NSRange r = [versionId rangeOfString:@"26."];
+    if (r.location == NSNotFound) {
+        return -1;
+    }
+    NSUInteger i = r.location + r.length;
+    NSUInteger n = versionId.length;
+    NSMutableString *digits = [NSMutableString string];
+    while (i < n) {
+        unichar ch = [versionId characterAtIndex:i];
+        if (ch < '0' || ch > '9') break;
+        [digits appendFormat:@"%C", ch];
+        i++;
+    }
+    if (digits.length == 0) {
+        return -1;
+    }
+    return [digits integerValue];
+}
+
+// ★ [METALLUM-264] metallum 版本家族解析（与 agent mcFamily() 同一口径）：
+//   "1211" = 1.21.x | "261" = 26.1 | "262" = 26.2 | "263" = 26.3 及其后（含 26.4+）
+// 26.4 归入 263 家族（renderpearl.api 命名空间 + SDL3 窗口未换代）。
+// 启动器显式把该家族透传给 agent（-Dmetallum.route.family=…），避免 agent 端
+// 靠零散 contains("26.3") 去猜（旧写法对 26.4 会漏判）。
+// 覆盖优先级最高（排障 / 回退，不必重装 app）：
+//   环境变量 METALLUM_ROUTE_FAMILY=1211|261|262|263
+static NSString *ameMetallumRouteFamily(NSString *versionId) {
+    const char *override = getenv("METALLUM_ROUTE_FAMILY");
+    if (override != NULL && override[0] != '\0') {
+        NSString *ov = [[NSString stringWithUTF8String:override] lowercaseString];
+        if ([ov isEqualToString:@"1211"] || [ov isEqualToString:@"261"] ||
+            [ov isEqualToString:@"262"] || [ov isEqualToString:@"263"]) {
+            return ov;
+        }
+    }
+    if ([versionId containsString:@"1.21"]) {
+        return @"1211";
+    }
+    NSInteger minor = ame98_mcMinorFromVersionId(versionId);
+    if (minor < 0) return @"262";   // 未知 / 空 ⇒ 既有 26.2 兜底
+    if (minor <= 1) return @"261";  // 26.0 / 26.1
+    if (minor == 2) return @"262";  // 26.2
+    return @"263";                  // 26.3 及其后（含 26.4+）
+}
+
 
 // SFPEW（固定管线仿真层）适用的 MC 版本判定：仅 GL 1.x 固定管线时代，即 <= 1.16.x。
 // MC 1.17 起渲染切到 GL 3.2 core + shader/VAO，不再有 immediate mode（glBegin/glEnd、
@@ -1826,6 +1878,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         ? [launchTarget[@"id"] description] : (NSString *)launchTarget;
     NSInteger metallumMcMajor = ame98_mcMajorFromVersionId(launchId);
     BOOL mcIs26Plus = (metallumMcMajor >= 26);
+    // ★ [METALLUM-264] 26.4 适配：显式解析并透传"版本家族"，agent 不再靠零散
+    //   contains("26.3") 猜版本（旧写法把 26.4 误判到 26.2 家族 ⇒ 类集/字节码补丁全错）。
+    //   26.4 归入 263 家族（renderpearl.api + SDL3，与 26.3 同族）。
+    //   可用环境变量 METALLUM_ROUTE_FAMILY=1211|261|262|263 覆盖（排障/回退）。
+    NSString *metallumFamily = ameMetallumRouteFamily(launchId);
     const char *rendC = getenv("AMETHYST_RENDERER");
     NSString *renderer = rendC ? @(rendC) : @"";
     NSString *rendererLower = renderer.lowercaseString;
@@ -1850,12 +1907,14 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     }
     if (wantsMetallumAgent
         && [fm fileExistsAtPath:[librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
-        NSLog(@"[AGENT-GATE] 注入 metallum_agent(MC=%@ major=%ld 渲染器=%@ AMETHYST_METAL=%@)",
-              launchId, (long)metallumMcMajor, renderer, metalFlagOn ? @"1" : @"(未置)");
+        NSLog(@"[AGENT-GATE] 注入 metallum_agent(MC=%@ major=%ld 家族=%@ 渲染器=%@ AMETHYST_METAL=%@)",
+              launchId, (long)metallumMcMajor, metallumFamily, renderer, metalFlagOn ? @"1" : @"(未置)");
         PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
         if (launchId.length > 0) {
             PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", launchId);
         }
+        // ★ [METALLUM-264] 显式家族路由（agent 端 mcFamily() 优先读该属性）。
+        PUSH_MARGV_FORMAT(@"-Dmetallum.route.family=%@", metallumFamily);
     }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
