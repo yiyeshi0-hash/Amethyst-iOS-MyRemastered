@@ -1187,8 +1187,15 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             [PLLogOutputView handleExitCode:1];
             return 1;
         }
-        JIT26SendJITScript([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]]);
-        JIT26SetDetachAfterFirstBr(!jit26AlwaysAttached);
+        // ★ [JIT-NOCRASH] 下发脚本 / 设置脱离均靠调试器服务 brk #0xf00d；裸调用在
+        // 调试器不在岗时会 SIGTRAP 直接致死。走安全网；降级只打日志并跳过该步，
+        // 后续 brk(PrepareRegion 等)同样会降级而非硬崩。
+        if (!JIT26SendJITScriptSafe([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]])) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] UniversalJIT26 script NOT delivered (brk #0xf00d unanswered) -- continuing in degraded mode");
+        }
+        if (!JIT26SetDetachAfterFirstBrSafe(!jit26AlwaysAttached)) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] SetDetachAfterFirstBr NOT applied -- continuing in degraded mode");
+        }
         // make sure we don't get stuck in EXC_BAD_ACCESS
         task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
     }
@@ -2702,8 +2709,15 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
             showDialog(localize(@"Error", nil), @"Support for legacy script has been removed. Please switch to Universal JIT script. To import it, long-press on Amethyst when enabling JIT in StikDebug and tap \"Assign Script\", then go to Amethyst's Documents directory and pick it. (on sideloaded StikDebug, the builtin script is named Amethyst-MeloNX.js)");
             return -1;
         }
-        JIT26SendJITScript([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]]);
-        JIT26SetDetachAfterFirstBr(!jit26AlwaysAttached);
+        // ★ [JIT-NOCRASH] 下发脚本 / 设置脱离均靠调试器服务 brk #0xf00d；裸调用在
+        // 调试器不在岗时会 SIGTRAP 直接致死。走安全网；降级只打日志并跳过该步，
+        // 后续 brk(PrepareRegion 等)同样会降级而非硬崩。
+        if (!JIT26SendJITScriptSafe([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]])) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] UniversalJIT26 script NOT delivered (brk #0xf00d unanswered) -- continuing in degraded mode");
+        }
+        if (!JIT26SetDetachAfterFirstBrSafe(!jit26AlwaysAttached)) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] SetDetachAfterFirstBr NOT applied -- continuing in degraded mode");
+        }
         task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
     }
 

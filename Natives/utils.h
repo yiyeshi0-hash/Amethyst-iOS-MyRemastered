@@ -161,8 +161,8 @@ void* JIT26PrepareRegion(void *addr, size_t len);
 //   之后调用(见 utils.m 内注释与 Natives/pocketj_jit/PORTING_NOTES.md)。
 void JIT26Detach(void);
 // JIT26Detach 的 SIGTRAP 安全网版:调试器已脱离时 brk #0xf00d 无人应答,
-// 捕获后直接返回,不使进程致死(与 JIT26CreateRegionLegacySafe 同款)。
-void JIT26DetachSafe(void);
+// 捕获后返回 NO(降级),不使进程致死(与 JIT26CreateRegionLegacySafe 同款)。
+BOOL JIT26DetachSafe(void);
 // ★ [POCKETJ-JIT] PocketJ 内置 StikJIT 的前置门禁(INTEGRATION.md「Gate every
 //   entry point」):iOS ≥17.4 + 宿主 get-task-allow + 可读配对文件。
 //   本仓库暂未接入 Helper 扩展,以下仅用于检测/日志/UI 提示,不做自附加调试器。
@@ -176,6 +176,18 @@ void AMEJITLogPocketJReadiness(NSString *context);
 void JIT26PrepareRegionForPatching(void *addr, size_t len);
 void JIT26SetDetachAfterFirstBr(BOOL value);
 void JIT26SendJITScript(NSString* script);
+
+// ★ [JIT-NOCRASH] 其余 JIT26 brk(#0xf00d)协议调用的 SIGTRAP 安全网包装。
+//   与 JIT26CreateRegionLegacySafe / JIT26DetachSafe 共用同一套 handler /
+//   sigjmp / armed 机制(分层、支持嵌套)。调试器在岗时行为与裸函数一致；无人
+//   应答时降级:返回 NO(或 NULL) 并仅在失败分支打日志,由调用方跳过该步,
+//   不再 SIGTRAP 致死。安全网只在"无人应答"时兜底,不干扰正常 JIT。
+//   JIT26PrepareRegionSafe 丢弃裸函数的 void* 返回值(无任何调用方使用),
+//   只回报"是否被调试器服务"。
+BOOL JIT26PrepareRegionSafe(void *addr, size_t len);
+BOOL JIT26PrepareRegionForPatchingSafe(void *addr, size_t len);
+BOOL JIT26SendJITScriptSafe(NSString *script);
+BOOL JIT26SetDetachAfterFirstBrSafe(BOOL value);
 
 // Device JIT flags（同步自上游 AngelAuraMC/Amethyst-iOS）
 // 支持 iOS 26.6+ / 27 的现代 Preboot 路径 + ChipID 硬件 fallback + capability 查询

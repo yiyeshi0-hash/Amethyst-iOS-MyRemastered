@@ -277,7 +277,8 @@ void* JIT26CreateRegionLegacy(size_t len) {
 //     就无法再被服务。本仓库现有启动流程靠 universal.js 的 detachAfterFirstBr
 //     在 dyld 补丁阶段的 JIT26PrepareRegion / JIT26PrepareRegionForPatching 之后
 //     隐式脱离,故这里只补齐协议原语,不在启动路径上另加调用点 —— 擅自提前脱离会让
-//     dyld_bypass_validation.m 里未包安全网的 brk 直接 SIGTRAP 崩溃。详见
+//     后续 brk 落在"无人服务"的窗口里,从而整体降级(★ [JIT-NOCRASH] 起,各调用
+//     点已走 Safe 包装,不再硬崩,但 JIT 功能会因此退化)。详见
 //     Natives/pocketj_jit/PORTING_NOTES.md。
 __attribute__((noinline,optnone,naked))
 void JIT26Detach(void) {
@@ -314,61 +315,221 @@ void JIT26SendJITScript(NSString* script) {
     BreakSendJITScript((char*)script.UTF8String, script.length);
 }
 
-// brk #0x69 无人应答时的 SIGTRAP 安全网：裸函数会直接致死（议题 #133
-// "开启 JIT 后闪退"），这里在调用窗口内捕获并返回 NULL，把必死崩溃转成
-// 调用方的优雅报错；调试器正常应答时走调试器例外端口/ptrace，本处理器
-// 不会被触发，行为不变。
-static sigjmp_buf g_jit26TrapEnv;
-static volatile sig_atomic_t g_jit26TrapArmed = 0;
+// ★ [JIT-NOCRASH] ============================================================
+// JIT26 brk 协议的统一 SIGTRAP 安全网
+//
+// universal 协议的每一步都靠 `brk` 与调试器握手（legacy 建区为 brk #0x69；其余
+// 全部为 brk #0xf00d）。**调试器未就岗时执行 brk ⇒ SIGTRAP ⇒ 进程直接死**，
+// 连"优雅放弃"的机会都没有（议题 #133「开启 JIT 后闪退」）。这里在调用窗口内
+// 布一层 SIGTRAP handler + sigsetjmp/siglongjmp：无人应答时把"必死崩溃"转成
+// "函数返回失败/降级"，由调用方跳过该步；调试器在岗时 brk 由调试器例外端口/
+// ptrace 现场服务（Mach 例外优先于信号转换），本 handler 根本不会触发，成功
+// 路径与裸调用逐字节一致 —— 安全网只在"无人应答"时兜底，不干扰正常 JIT。
+//
+// 嵌套/可重入（硬约束 5）：裸协议函数全是叶子（naked asm，只 brk+ret，不再调用
+// 别人），单次窗口不会自嵌套；但调用方可能嵌套（外层窗口未退出时又走进另一个
+// [JIT-NOCRASH] 包装）。旧的单缓冲 g_jit26TrapEnv 一旦被内层 sigsetjmp 覆盖，
+// 外层的 siglongjmp 目标即失效 —— 故这里改成【按深度索引的 sigjmp_buf 槽位
+// 栈】：第 0 层复用 g_jit26TrapEnv（保留旧名），更深层用 g_jit26TrapNestEnv[]；
+// handler 永远跳到最内层活动窗口，最内层在跳回后把 depth 回退到自己的槽位，
+// 外层窗口继续存活。g_jit26TrapArmed 保留为"是否有窗口在等 brk 应答"的兼容标志。
+// ============================================================================
+#define JIT26_TRAP_MAX_DEPTH 8
+
+static sigjmp_buf g_jit26TrapEnv;                            // 第 0 层窗口缓冲（复用旧名）
+static sigjmp_buf g_jit26TrapNestEnv[JIT26_TRAP_MAX_DEPTH];  // 更深层窗口槽位
+static volatile sig_atomic_t g_jit26TrapDepth = 0;           // 活动窗口层数（0=未布网）
+static volatile sig_atomic_t g_jit26TrapArmed = 0;           // 兼容标志：>0 即有窗口在等 brk
+
+// 取 depth 对应的窗口缓冲。返回值恒非 NULL（depth 已被 push/pop 约束在 [0,MAX)）。
+static sigjmp_buf *JIT26TrapSlotForDepth(int depth) {
+    if (depth <= 0) return &g_jit26TrapEnv;
+    if (depth < JIT26_TRAP_MAX_DEPTH) return &g_jit26TrapNestEnv[depth];
+    return &g_jit26TrapNestEnv[JIT26_TRAP_MAX_DEPTH - 1];
+}
 
 static void JIT26TrapCatch(int sig) {
-    if (!g_jit26TrapArmed) {
+    if (!g_jit26TrapArmed || g_jit26TrapDepth <= 0) {
         // 不属于本安全网的 SIGTRAP：恢复默认语义原样致死，不吞异常
         signal(sig, SIG_DFL);
         raise(sig);
         return;
     }
-    g_jit26TrapArmed = 0;
-    siglongjmp(g_jit26TrapEnv, 1);
+    // 跳到最内层活动窗口；depth 与 sigaction 由该窗口自己回退。
+    sigjmp_buf *env = JIT26TrapSlotForDepth((int)g_jit26TrapDepth - 1);
+    siglongjmp(*env, 1);
 }
 
-void* JIT26CreateRegionLegacySafe(size_t len) {
-    struct sigaction sa, oldsa;
+// 进入窗口：安装 handler、登记本层槽位。返回本层索引；<0 = 深度超限无法布网，
+// 调用方【必须】据此直接降级，绝不能再调用裸 brk 函数。
+static int JIT26TrapWindowPush(struct sigaction *oldsa, sigjmp_buf **outEnv) {
+    struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = JIT26TrapCatch;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_NODEFER;
-    sigaction(SIGTRAP, &sa, &oldsa);
+    if (oldsa) memset(oldsa, 0, sizeof(*oldsa));   // sigaction 万一失败也不回装垃圾
+    sigaction(SIGTRAP, &sa, oldsa);
 
-    void *result = NULL;
-    if (sigsetjmp(g_jit26TrapEnv, 1) == 0) {
-        g_jit26TrapArmed = 1;
-        result = JIT26CreateRegionLegacy(len);
+    int idx = (int)g_jit26TrapDepth;
+    if (idx < 0 || idx >= JIT26_TRAP_MAX_DEPTH) {
+        sigaction(SIGTRAP, oldsa, NULL);   // 回滚，保持环境原样
+        if (outEnv) *outEnv = NULL;
+        return -1;
+    }
+    if (outEnv) *outEnv = JIT26TrapSlotForDepth(idx);
+    g_jit26TrapDepth = idx + 1;
+    g_jit26TrapArmed = 1;
+    return idx;
+}
+
+// 退出窗口：把 depth 回退到本层（处理"从 handler 跳回时更内层已被解开"的情形），
+// 恢复原 SIGTRAP 处置。idx<0（未曾布网成功）时不动 depth。
+static void JIT26TrapWindowPop(int idx, struct sigaction *oldsa) {
+    if (idx >= 0 && g_jit26TrapDepth > idx) {
+        g_jit26TrapDepth = idx;
+    }
+    if (g_jit26TrapDepth <= 0) {
         g_jit26TrapArmed = 0;
+    }
+    sigaction(SIGTRAP, oldsa, NULL);
+}
+
+// 布网失败（深度超限）时的统一降级日志。
+static void JIT26LogWindowOverflow(const char *op) {
+    NSLog(@"[JIT26] [JIT-NOCRASH] %s: trap-window depth overflow (%d) -- skipping raw brk (degrade)",
+          op, (int)JIT26_TRAP_MAX_DEPTH);
+}
+
+// brk #0x69（legacy 建区）安全网：无人应答返回 NULL；调试器在岗返回裸函数值。
+void* JIT26CreateRegionLegacySafe(size_t len) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26CreateRegionLegacySafe");
+        return NULL;
+    }
+    void *result = NULL;
+    if (sigsetjmp(*env, 1) == 0) {
+        result = JIT26CreateRegionLegacy(len);
     } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0x69 NOT serviced (no debugger) -- degraded, returning NULL");
         result = NULL;
     }
-    sigaction(SIGTRAP, &oldsa, NULL);
+    JIT26TrapWindowPop(idx, &oldsa);
     return result;
 }
 
-// ★ [POCKETJ-JIT] JIT26Detach 的 SIGTRAP 安全网版:与 JIT26CreateRegionLegacySafe
-//   同款。调试器已脱离时 brk #0xf00d 无人应答,捕获后直接返回,不使进程致死;
-//   调试器在岗时 brk 由调试器例外端口服务,本处理器不触发,行为与裸函数一致。
-void JIT26DetachSafe(void) {
-    struct sigaction sa, oldsa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = JIT26TrapCatch;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_NODEFER;
-    sigaction(SIGTRAP, &sa, &oldsa);
-
-    if (sigsetjmp(g_jit26TrapEnv, 1) == 0) {
-        g_jit26TrapArmed = 1;
-        JIT26Detach();
-        g_jit26TrapArmed = 0;
+// ★ [POCKETJ-JIT] brk #0xf00d cmd=0（显式请求调试器脱离）安全网：与
+//   JIT26CreateRegionLegacySafe 同款。调试器已脱离时 brk 无人应答，捕获后返回
+//   NO 而不使进程致死；调试器在岗时 brk 由调试器例外端口服务，行为与裸函数一致。
+BOOL JIT26DetachSafe(void) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26DetachSafe");
+        return NO;
     }
-    sigaction(SIGTRAP, &oldsa, NULL);
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26Detach();
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=0 detach) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=1（准备可写别名）安全网。裸函数返回值无调用方
+//   使用，这里只报"是否被调试器服务"；降级返回 NO。
+BOOL JIT26PrepareRegionSafe(void *addr, size_t len) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26PrepareRegionSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        (void)JIT26PrepareRegion(addr, len);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] PrepareRegion serviced (addr=%p len=%lu)", addr, (unsigned long)len);
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=1 PrepareRegion) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=4（小区域、保留内容）安全网；降级返回 NO。
+BOOL JIT26PrepareRegionForPatchingSafe(void *addr, size_t len) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26PrepareRegionForPatchingSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26PrepareRegionForPatching(addr, len);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] PrepareRegionForPatching serviced (addr=%p len=%lu)", addr, (unsigned long)len);
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=4 PrepareRegionForPatching) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=2（下发 UniversalJIT26 script）安全网；降级返回 NO。
+BOOL JIT26SendJITScriptSafe(NSString *script) {
+    if (script == nil) {
+        NSLog(@"[JIT26] [JIT-NOCRASH] SendJITScript skipped: script is nil");
+        return NO;
+    }
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26SendJITScriptSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26SendJITScript(script);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] SendJITScript serviced");
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=2 SendJITScript) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=3（首次 brk 后是否自动脱离）安全网；降级返回 NO。
+BOOL JIT26SetDetachAfterFirstBrSafe(BOOL value) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26SetDetachAfterFirstBrSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26SetDetachAfterFirstBr(value);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] SetDetachAfterFirstBr(%d) serviced", (int)value);
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=3 SetDetachAfterFirstBr) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
 }
 
 // ============================================================================

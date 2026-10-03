@@ -69,7 +69,12 @@ bool redirectFunctionDirect(char *name, void *patchAddr, void *target) {
 // redirectFunction for iOS 26+ (TXM)
 bool redirectFunctionMirrored(char *name, void *patchAddr, void *target) {
     if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
-        JIT26PrepareRegionForPatching(patchAddr, sizeof(patch));
+        // ★ [JIT-NOCRASH] 该步靠调试器服务 brk #0xf00d；裸调用在调试器不在岗时
+        // 会 SIGTRAP 直接致死。走安全网：降级则本轮补丁整体跳过(返回 FALSE)。
+        if (!JIT26PrepareRegionForPatchingSafe(patchAddr, sizeof(patch))) {
+            NSDebugLog(@"[DyldLVBypass] PrepareRegionForPatching degraded (no debugger servicing brk) -- skip hook %s", name);
+            return FALSE;
+        }
     }
     // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
     vm_address_t mirrored = 0;
@@ -172,7 +177,13 @@ void* hooked_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off
         //printf("[DyldLVBypass] mmap(prot=%d, flags=%d, fd=%d)\n", prot, flags, fd);
         map = __mmap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANON, 0, 0);
         if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
-            JIT26PrepareRegion(map, len);
+            // ★ [JIT-NOCRASH] 裸 PrepareRegion 在调试器不在岗时 SIGTRAP 致死；
+            // 安全网降级 ⇒ 放弃这次 RX 映射(否则随后执行非可执行页会 SIGBUS)。
+            if (!JIT26PrepareRegionSafe(map, len)) {
+                NSDebugLog(@"[DyldLVBypass] PrepareRegion degraded (no debugger servicing brk) -- munmap and fail mmap");
+                munmap(map, len);
+                return MAP_FAILED;
+            }
         }
         
         void *memoryLoadedFile = __mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, offset);
