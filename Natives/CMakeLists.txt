@@ -394,6 +394,9 @@ add_executable(AngelAuraAmethyst
   #   shaderc_include.c 为 Task 47 RenderPearl `#include <minecraft:...>` 展开器(上游 exe 列表成员)。
   sdl3_hook.m
   shaderc_include.c
+  # ★ [SHADER-CAP] Metal 光影能力：GL 入口运行时探测 + 诚实扩展上报 + core→EXT 别名映射
+  #   (只追加；被 sdl3_hook.m 引用，纯 C 编译为 ObjC 仅为用 NSLog)
+  shader_cap_probe.m
   JavaLauncher.m
   external/fishhook/fishhook.c
   UIKit+hook.m
