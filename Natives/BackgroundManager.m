@@ -244,7 +244,7 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
         UIColor *c = blobs[i];
         CAGradientLayer *l = _motionBlobLayers[i];
         l.colors    = @[(id)c.CGColor,
-                        (id)[c colorWithAlphaComponent:c.alpha * 0.55].CGColor,
+                        (id)[c colorWithAlphaComponent:CGColorGetAlpha(c.CGColor) * 0.55].CGColor,
                         (id)[c colorWithAlphaComponent:0.0].CGColor];
         l.locations = @[@0.0, @0.45, @1.0];
     }
