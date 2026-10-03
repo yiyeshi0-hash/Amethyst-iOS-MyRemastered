@@ -320,6 +320,21 @@ static void PALCacheWrite(NSString *vendor, NSString *gameVersion, NSArray<NSStr
     [filtered sortUsingComparator:^NSComparisonResult(NSString *v1, NSString *v2) {
         return [v2 compare:v1 options:NSNumericSearch];
     }];
+    // ★ [NEOFORGE-FIX] 把“过滤前 N 条 / 归属到本 MC 的 M 条 / 若为 0 则给出前几条的归属推断”打清楚，
+    //   这样用户贴日志即可判断是“命名映射错”还是“该 MC 真没有 NeoForge”。
+    NSLog(@"[PCL-ALIGN] NeoForgeVersionFetcher filter: targetMC=%@ in=%lu matched=%lu",
+          gameVersion, (unsigned long)versions.count, (unsigned long)filtered.count);
+    if (filtered.count == 0 && versions.count > 0) {
+        NSMutableString *sample = [NSMutableString string];
+        NSUInteger n = MIN((NSUInteger)6, versions.count);
+        for (NSUInteger i = 0; i < n; i++) {
+            id v = versions[i];
+            if (![v isKindOfClass:[NSString class]]) continue;
+            [sample appendFormat:@"%@→%@ ", v, [self extractMinecraftVersionFromNeoForgeVersion:v]];
+        }
+        NSLog(@"[PCL-ALIGN] NeoForgeVersionFetcher filter: 0 matched for mc=%@; sample(v→inferredMC)=%@",
+              gameVersion, sample.length ? sample : @"(no string entries)");
+    }
     return filtered;
 }
 
@@ -375,14 +390,17 @@ static void PALCacheWrite(NSString *vendor, NSString *gameVersion, NSArray<NSStr
             //     中 maven 坐标版本错误 → 404
             //
             // 正确实现：用 minor（components[1]）作为 MC patch 号，与 ForgeInstallViewController.m 一致
-            if (majorVal >= 20) {
-                // 20.x+ (NeoForge 20.x 对应 MC 1.20.x)：统一用 minor 作为 MC patch
-                // 覆盖 20.2.88 → 1.20.2、21.1.5 → 1.21.1、26.1.0 → 1.26.1 等所有情况
-                return [NSString stringWithFormat:@"1.%@.%@", major, minor];
-            } else {
-                // Old format fallback（理论上 NeoForge 不存在 < 20 的版本）
-                return [NSString stringWithFormat:@"1.%@.%@", major, minor];
+            // ★ [NEOFORGE-FIX] 年份制命名（Mojang 26.x 起，NeoForge 改为与 MC 同号）：
+            //   实测 BMCLAPI /neoforge/list/26.2 条目 version="26.2.0.0-beta"、mcversion="26.2"；
+            //   此命名下 **MC 版本不带 "1." 前缀** —— 26.2.0.0-beta → MC "26.2"。
+            //   旧逻辑一律当 "1.<major>.<minor>" ⇒ 得到 "1.26.2" ≠ "26.2"，26.2 的 89 条全被过滤掉，
+            //   用户看到空列表 +“加载失败”。判据 major>=25（旧命名 major 只到 21；快照走上面 "0." 分支）。
+            if (majorVal >= 25) {
+                return [NSString stringWithFormat:@"%@.%@", major, minor];
             }
+            // 旧命名（NeoForge 20.x/21.x 对应 MC 1.20.x/1.21.x）：MC 版本 = 1.<major>.<minor>
+            // 覆盖 20.2.88 → 1.20.2、21.1.5 → 1.21.1；minor 才是 MC patch，patch 是 NeoForge 自己的 build 号。
+            return [NSString stringWithFormat:@"1.%@.%@", major, minor];
         }
     }
 

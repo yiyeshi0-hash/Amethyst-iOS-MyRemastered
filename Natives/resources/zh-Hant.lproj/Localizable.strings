@@ -1744,6 +1744,8 @@
 "i18n_str_1208" = "暂无可用版本";
 "i18n_str_1209" = "加载失败，请检查网络";
 "i18n_str_1210" = "加载失败：%@";
+// ★ [NEOFORGE-FIX] NeoForge 尚未为该 Minecraft 版本发版（诚实告知，不谎报版本）
+"neoforge.no_version_for_mc" = "Minecraft %@ 暫無 NeoForge 適配版本";
 "i18n_str_1211" = "选择安装方式";
 "i18n_str_1212" = "原版 (Vanilla)";
 "i18n_str_1213" = "纯净 Minecraft，不包含任何模组加载器";

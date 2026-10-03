@@ -774,13 +774,40 @@ static NSArray<NSString *> *PALParseForgeMetaXML(NSData *data, NSString *gameVer
     //   BMCLAPI 轻接口优先 + 两/三种 JSON 形态通吃 + rawVersion 归一化 + 6h 磁盘缓存）。
     NSLog(@"[PCL-ALIGN] ModLoaderInstallViewController.loadNeoForgeVersions begin: mc=%@ (delegates to NeoForgeVersionFetcher.m)", _gameVersion ?: @"");
     __weak typeof(self) weakSelf = self;
+    // ★ [NEOFORGE-FIX] 捕获当前 MC 版本：空结果提示需要它（例如 MC 26.4 实测 /neoforge/list/26.4 返回 []，
+    //   NeoForge 尚未为该版本发版）。不能把“没有适配”谎报成有版本，也不该空转/无限加载。
+    NSString *mcForLog = [_gameVersion copy];
     [NeoForgeVersionFetcher fetchVersionsForGameVersion:_gameVersion completion:^(NSArray *versions, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
+            // ★ [NEOFORGE-FIX] error.code==2 表示“源里确实有数据，但没有任何一条归属到当前 MC” ⇒
+            //   该 MC 版本暂无 NeoForge 适配（诚实告知），而不是“加载失败/请检查网络”。
+            if ((versions == nil || versions.count == 0) &&
+                error && [error.domain isEqualToString:@"NeoForge"] && error.code == 2) {
+                [strongSelf finishNeoForgeUnavailableForGameVersion:mcForLog];
+                return;
+            }
             [strongSelf finishLoadingWithVersions:versions ?: @[] error:error];
         });
     }];
+}
+
+// ★ [NEOFORGE-FIX] NeoForge 无适配版本时的专用提示：明确“该 MC 版本暂无 NeoForge 适配”，
+//   不谎报版本、不空列表、不无限加载。文案 neoforge.no_version_for_mc 含 %@（MC 版本号）。
+- (void)finishNeoForgeUnavailableForGameVersion:(NSString *)gameVersion {
+    [_loadingIndicator stopAnimating];
+    _isParsingForge = NO;
+    _versions = @[];
+    _emptyLabel.hidden = YES;
+    _errorLabel.hidden = NO;
+    if (gameVersion.length > 0) {
+        _errorLabel.text = [NSString stringWithFormat:localize(@"neoforge.no_version_for_mc", nil), gameVersion];
+    } else {
+        _errorLabel.text = localize(@"i18n_str_1208", nil);
+    }
+    [_tableView reloadData];
+    NSLog(@"[PCL-ALIGN] ModLoaderInstallViewController NeoForge unavailable: mc=%@ → 提示 neoforge.no_version_for_mc（该版本暂无 NeoForge 适配）", gameVersion ?: @"");
 }
 
 #pragma mark OptiFine (BMCLAPI 列表)
