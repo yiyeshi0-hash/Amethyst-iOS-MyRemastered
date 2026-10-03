@@ -2005,6 +2005,10 @@
 "preference.title.glass_effect" = "Glass Effect";
 "preference.title.glass_strength" = "Glass Strength";
 
+// ★ [MOTION-BG] flowing light effect on the default background (switch + speed slider)
+"preference.title.motion_effect" = "Flowing Light Effect";
+"preference.title.motion_speed" = "Flow Speed";
+
 // ★ [LANG-SWITCH] launcher language switch (follow system + auto-enumerated .lproj)
 "preference.title.launcher_language" = "Language";
 "preference.lang.title" = "Language";

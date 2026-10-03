@@ -142,7 +142,9 @@
         @[localize(@"i18n_str_61", nil), localize(@"i18n_str_55", nil)],
         @[localize(@"i18n_str_62", nil), localize(@"i18n_str_63", nil)],
         // ★ [GLASSUI] 玻璃效果:row0=高光开关(UISwitch),row1=强度滑块(UISlider,0…1)
-        @[localize(@"preference.title.glass_effect", nil), localize(@"preference.title.glass_strength", nil)]
+        @[localize(@"preference.title.glass_effect", nil), localize(@"preference.title.glass_strength", nil)],
+        // ★ [MOTION-BG] 默认背景流动光效:row0=开关(UISwitch),row1=速度滑块(UISlider,0.3…1.6)
+        @[localize(@"preference.title.motion_effect", nil), localize(@"preference.title.motion_speed", nil)]
     ];
 }
 
@@ -161,11 +163,19 @@
     if (section == 0 && ![[BackgroundManager sharedManager] hasBackground]) {
         return 0;
     }
+    // ★ [MOTION-BG] 流动光效只作用于「默认背景」⇒ 有自定义背景图/视频时不显示
+    if (section == 5 && [[BackgroundManager sharedManager] hasBackground]) {
+        return 0;
+    }
     return [self.sections[section] count];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if (section == 0 && ![[BackgroundManager sharedManager] hasBackground]) {
+        return nil;
+    }
+    // ★ [MOTION-BG] 同 numberOfRows:有自定义背景时本段不显示
+    if (section == 5 && [[BackgroundManager sharedManager] hasBackground]) {
         return nil;
     }
     return self.sections[section][0];
@@ -349,6 +359,69 @@
         return cell;
     }
 
+    // ★ [MOTION-BG] 流动光效 section:row0=开关(UISwitch),row1=速度滑块(UISlider,0.3…1.6)
+    if (indexPath.section == 5) {
+        if (indexPath.row == 0) {
+            static NSString *motionSwitchCellIdentifier = @"MotionSwitchCell";   // ★ [MOTION-BG]
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:motionSwitchCellIdentifier];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:motionSwitchCellIdentifier];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UISwitch *sw = [[UISwitch alloc] init];
+                sw.tag = 500;   // ★ [MOTION-BG]
+                [sw addTarget:self action:@selector(motionSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
+            cell.textLabel.text = self.sections[indexPath.section][indexPath.row];
+            cell.imageView.image = [UIImage systemImageNamed:@"sparkles.rectangle.stack"];
+            // 回读当前值并同步控件状态
+            UISwitch *sw = (UISwitch *)cell.accessoryView;
+            if ([sw isKindOfClass:[UISwitch class]]) { sw.on = manager.motionBackgroundEnabled; }
+            [self styleCell:cell hasBackground:hasBackground];
+            return cell;
+        }
+
+        static NSString *motionSliderCellIdentifier = @"MotionSliderCell";   // ★ [MOTION-BG]
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:motionSliderCellIdentifier];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:motionSliderCellIdentifier];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+            UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 0, cell.bounds.size.width - 120, 30)];
+            slider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+            slider.minimumValue = 0.3f;
+            slider.maximumValue = 1.6f;   // ★ 与 BackgroundManager 的 clamp 区间一致
+            slider.tag = 510;             // ★ [MOTION-BG]
+            [slider addTarget:self action:@selector(motionSpeedSliderChanged:) forControlEvents:UIControlEventValueChanged];
+
+            UILabel *valueLabel = [[UILabel alloc] initWithFrame:CGRectMake(cell.bounds.size.width - 80, 0, 60, 30)];
+            valueLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+            valueLabel.textAlignment = NSTextAlignmentRight;
+            valueLabel.tag = 511;         // ★ [MOTION-BG]
+            valueLabel.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightRegular];
+
+            [cell.contentView addSubview:slider];
+            [cell.contentView addSubview:valueLabel];
+            cell.contentView.layoutMargins = UIEdgeInsetsMake(8, 16, 8, 16);
+        }
+
+        [self styleCell:cell hasBackground:hasBackground];
+        cell.textLabel.text = nil;
+        cell.imageView.image = [UIImage systemImageNamed:@"slider.horizontal.3"];
+
+        UISlider *slider = [cell.contentView viewWithTag:510];
+        if ([slider isKindOfClass:[UISlider class]]) {
+            slider.value = manager.motionBackgroundSpeed;   // 回读当前值(已夹紧)
+            slider.enabled = manager.motionBackgroundEnabled;   // 关闭光效时滑块置灰(HIG)
+        }
+        UILabel *valueLabel = [cell.contentView viewWithTag:511];
+        if ([valueLabel isKindOfClass:[UILabel class]]) {
+            valueLabel.text = [NSString stringWithFormat:@"%.1f×", manager.motionBackgroundSpeed];
+            valueLabel.textColor = hasBackground ? [UIColor whiteColor] : [UIColor labelColor];
+        }
+        return cell;
+    }
+
     // 其他部分
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellIdentifier];
     if (!cell) {
@@ -456,6 +529,34 @@
     }
 }
 
+#pragma mark - ★ [MOTION-BG] 流动光效 开关 / 速度
+
+// 开关:setter 内已做「夹紧 + 持久化 + 即时生效(找到默认背景视图重载光效状态)」,
+// 这里只同步同页速度滑块的可用态。
+- (void)motionSwitchChanged:(UISwitch *)sw {
+    [BackgroundManager sharedManager].motionBackgroundEnabled = sw.on;
+
+    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:1 inSection:5]];
+    if ([cell isKindOfClass:[UITableViewCell class]]) {
+        UISlider *slider = [cell.contentView viewWithTag:510];
+        if ([slider isKindOfClass:[UISlider class]]) {
+            slider.enabled = sw.on;
+            slider.value = [BackgroundManager sharedManager].motionBackgroundSpeed;
+        }
+    }
+}
+
+// 速度:setter 内 clamp(0.3…1.6)+ 持久化 + 即时生效(重建动画周期);这里只更新数值标签。
+- (void)motionSpeedSliderChanged:(UISlider *)slider {
+    [BackgroundManager sharedManager].motionBackgroundSpeed = slider.value;
+
+    UITableViewCell *cell = (UITableViewCell *)slider.superview.superview;
+    if ([cell isKindOfClass:[UITableViewCell class]]) {
+        UILabel *valueLabel = [cell.contentView viewWithTag:511];
+        valueLabel.text = [NSString stringWithFormat:@"%.1f×", [BackgroundManager sharedManager].motionBackgroundSpeed];
+    }
+}
+
 #pragma mark - Table View Delegate
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -480,6 +581,19 @@
             if ([sw isKindOfClass:[UISwitch class]]) {
                 [sw setOn:!sw.on animated:YES];
                 [self glassSwitchChanged:sw];
+            }
+        }
+        return;
+    }
+    
+    // ★ [MOTION-BG] 点整行也能切换流动光效开关(与点 UISwitch 等效;HIG 习惯)
+    if (indexPath.section == 5) {
+        if (indexPath.row == 0) {
+            UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:indexPath];
+            UISwitch *sw = (UISwitch *)cell.accessoryView;
+            if ([sw isKindOfClass:[UISwitch class]]) {
+                [sw setOn:!sw.on animated:YES];
+                [self motionSwitchChanged:sw];
             }
         }
         return;

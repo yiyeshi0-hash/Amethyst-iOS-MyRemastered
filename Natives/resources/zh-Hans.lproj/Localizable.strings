@@ -2001,6 +2001,10 @@
 "preference.title.glass_effect" = "玻璃效果";
 "preference.title.glass_strength" = "玻璃强度";
 
+// ★ [MOTION-BG] 默认背景流动光效(开关 + 速度滑块)
+"preference.title.motion_effect" = "流动光效";
+"preference.title.motion_speed" = "流动速度";
+
 // ★ [LANG-SWITCH] 启动器界面语言切换(跟随系统 + 自动枚举 .lproj)
 "preference.title.launcher_language" = "语言";
 "preference.lang.title" = "语言";

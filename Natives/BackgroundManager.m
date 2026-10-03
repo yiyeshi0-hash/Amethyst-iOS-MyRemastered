@@ -17,6 +17,8 @@ static NSString * const kBackgroundUIOpacityKey = @"background_ui_opacity";
 static NSString * const kBackgroundBlurIntensityKey = @"background_blur_intensity";
 static NSString * const kGlassRimEnabledKey  = @"background_glass_rim_enabled";   // ★ [RIM-UI]
 static NSString * const kGlassRimStrengthKey = @"background_glass_rim_strength";  // ★ [RIM-UI]
+static NSString * const kMotionEnabledKey    = @"background_motion_enabled";      // ★ [MOTION-BG]
+static NSString * const kMotionSpeedKey      = @"background_motion_speed";        // ★ [MOTION-BG]
 static NSString * const kBackgroundsFolder = @"backgrounds";
 static const NSInteger kGlobalBackgroundTag = 99999;
 static const NSInteger kBackgroundImageTag = 99998;
@@ -33,10 +35,24 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
 // 本视图自绘渐变(base 线性 + 3 个椭圆径向光斑),仅当 currentType == BackgroundTypeNone
 // (无自定义背景)时挂载 ⇒ 不触碰自定义背景图/视频路径,主界面自定义能力保留。
 @interface AmeGradientBackgroundView : UIView
+// ★ [MOTION-BG] 设置(开关/速度)变化后重载光效状态(降级判定 + 重建动画)
+- (void)ame_refreshFromSettings;
+// ★ [MOTION-BG] 前后台暂停/恢复:active=NO 冻结全部光斑动画,=YES 恢复
+- (void)ame_setMotionActive:(BOOL)active;
 @end
 
 @implementation AmeGradientBackgroundView {
     CGSize _ameLastLayoutSize;
+    // ★ [MOTION-BG] 流动光效图层(全部由 Core Animation 跑在 render server 上,主线程零逐帧绘制):
+    //   _motionBaseLayer   : 线性底色(静态,深浅色自适应)
+    //   _motionBlobLayers  : 3 个径向渐变光斑(柔和游动,靠渐变透明衰减,不用高斯模糊 → 省 GPU)
+    CAGradientLayer *_motionBaseLayer;
+    NSMutableArray<CAGradientLayer *> *_motionBlobLayers;
+    BOOL _motionBuilt;      // 图层是否已创建
+    BOOL _motionAllowed;    // 设置 + 环境(减动/低电量/低端机)是否允许跑
+    BOOL _motionSuspended;  // 前后台暂停标记
+    BOOL _motionRunning;    // 当前是否「光效可见并运行」
+    BOOL _motionPaused;     // CA 冻结标记(layer.speed == 0)
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -54,6 +70,8 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
     [super traitCollectionDidChange:previousTraitCollection];
     if (@available(iOS 13.0, *)) {
         if (previousTraitCollection.userInterfaceStyle != self.traitCollection.userInterfaceStyle) {
+            // ★ [MOTION-BG] 深浅色切换:光效配色跟着换
+            if (_motionRunning) { [self ame_applyMotionAppearance]; }
             [self setNeedsDisplay];
         }
     }
@@ -64,11 +82,15 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
     // 尺寸变化(旋转/分屏)后重绘,保证渐变铺满
     if (!CGSizeEqualToSize(_ameLastLayoutSize, self.bounds.size)) {
         _ameLastLayoutSize = self.bounds.size;
+        // ★ [MOTION-BG] 关键帧用的是绝对点坐标,尺寸一变必须按新 bounds 重建动画
+        if (_motionRunning) { [self ame_installMotionAnimations]; }
         [self setNeedsDisplay];
     }
 }
 
 - (void)drawRect:(CGRect)rect {
+    // ★ [MOTION-BG] 光效运行时由图层绘制(drawRect 不画,避免与图层叠加、也不浪费 CPU)
+    if (_motionRunning) { return; }
     BOOL dark = YES;
     if (@available(iOS 13.0, *)) {
         dark = (self.traitCollection.userInterfaceStyle != UIUserInterfaceStyleLight);
@@ -153,6 +175,210 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
                                rx:r3x ry:r3y color:r3 stop:r3s];
 }
 
+#pragma mark - ★ [MOTION-BG] 流动光效(图层 + CAKeyframeAnimation;暂停 / 降级 / 配色)
+//
+// 设计要点:
+//   ① 全部用 CALayer 子层 + CAKeyframeAnimation,动画由 Core Animation 在 render server 上驱动,
+//      主线程不做任何逐帧计算(不是 CADisplayLink 定时器,不占 CPU);系统会在有变化时才合成。
+//   ② 光斑的柔边靠「径向渐变到 alpha=0」实现,不用 CIFilter 高斯模糊(iOS 上 layer.filters 不生效,
+//      也无法离屏模糊)→ 零额外 GPU pass。
+//   ③ 前后台走 CA 标准冻结(layer.speed=0 + timeOffset),回前台按时间差续跑,不重建、不耗电。
+//   ④ 关开关 / 减弱动态效果 / 低电量 / 低端设备 → 移除动画并隐藏图层,交回 drawRect 静态渐变。
+
+// 是否允许跑(开关 && 非减动 && 非低电量 && 非低端机;判定集中在 BackgroundManager)
+- (BOOL)ame_motionShouldRun {
+    return [[BackgroundManager sharedManager] motionBackgroundAllowed];
+}
+
+// 创建图层(幂等)。radial 渐变用正方形图层 + endPoint(1,0.5) 让圆正好内切边,
+// 四角与四边都是全透明,不会露出硬边;再用 transform 缩放成椭圆。
+- (void)ame_buildMotionLayersIfNeeded {
+    if (_motionBuilt) { return; }
+    _motionBuilt = YES;
+
+    _motionBaseLayer = [CAGradientLayer layer];
+    _motionBaseLayer.type       = kCAGradientLayerAxial;
+    _motionBaseLayer.startPoint = CGPointMake(0.5, 0.0);
+    _motionBaseLayer.endPoint   = CGPointMake(0.5, 1.0);
+    [self.layer insertSublayer:_motionBaseLayer atIndex:0];
+
+    _motionBlobLayers = [NSMutableArray arrayWithCapacity:3];
+    for (NSInteger i = 0; i < 3; i++) {
+        CAGradientLayer *b = [CAGradientLayer layer];
+        b.type       = kCAGradientLayerRadial;
+        b.startPoint = CGPointMake(0.5, 0.5);
+        b.endPoint   = CGPointMake(1.0, 0.5);   // 半径 = 半边 ⇒ 圆内切,透明边
+        b.locations  = @[@0.0, @0.45, @1.0];    // 中心实 → 中段 → 边缘全透明(柔边)
+        [self.layer addSublayer:b];
+        [_motionBlobLayers addObject:b];
+    }
+}
+
+// 按深浅色刷两套配色(沿用原静态渐变的色值,深=紫蓝 / 浅=白→粉紫)
+- (void)ame_applyMotionAppearance {
+    if (!_motionBuilt) { return; }
+    BOOL dark = YES;
+    if (@available(iOS 13.0, *)) {
+        dark = (self.traitCollection.userInterfaceStyle != UIUserInterfaceStyleLight);
+    }
+
+    UIColor *base0 = nil, *base1 = nil, *b0 = nil, *b1 = nil, *b2 = nil;
+    if (dark) {
+        base0 = AmeRGBA(0x10, 0x13, 0x22, 1.0);
+        base1 = AmeRGBA(0x05, 0x06, 0x0C, 1.0);
+        b0 = AmeRGBA(90, 130, 255, 0.85);    // 蓝
+        b1 = AmeRGBA(210, 90, 220, 0.80);    // 品红
+        b2 = AmeRGBA(0, 220, 200, 0.55);     // 青
+    } else {
+        base0 = AmeRGBA(0xEE, 0xF3, 0xFF, 1.0);
+        base1 = AmeRGBA(0xFD, 0xF8, 0xFF, 1.0);
+        b0 = AmeRGBA(150, 185, 255, 1.0);
+        b1 = AmeRGBA(255, 175, 235, 1.0);
+        b2 = AmeRGBA(160, 240, 225, 0.95);
+    }
+    _motionBaseLayer.colors    = @[(id)base0.CGColor, (id)base1.CGColor];
+    _motionBaseLayer.locations = @[@0.0, @1.0];
+
+    NSArray<UIColor *> *blobs = @[b0, b1, b2];
+    for (NSInteger i = 0; i < (NSInteger)_motionBlobLayers.count && i < (NSInteger)blobs.count; i++) {
+        UIColor *c = blobs[i];
+        CAGradientLayer *l = _motionBlobLayers[i];
+        l.colors    = @[(id)c.CGColor,
+                        (id)[c colorWithAlphaComponent:c.alpha * 0.55].CGColor,
+                        (id)[c colorWithAlphaComponent:0.0].CGColor];
+        l.locations = @[@0.0, @0.45, @1.0];
+    }
+}
+
+// 按当前 bounds / 速度重建关键帧动画(首建、旋转、改速度都会走到这里)
+- (void)ame_installMotionAnimations {
+    if (!_motionBuilt) { [self ame_buildMotionLayersIfNeeded]; }
+    CGSize sz = self.bounds.size;
+    if (sz.width <= 1.0 || sz.height <= 1.0) { return; }
+
+    CGFloat speed = [BackgroundManager sharedManager].motionBackgroundSpeed;
+    if (speed < 0.2) { speed = 0.2; }
+
+    _motionBaseLayer.frame = self.bounds;
+
+    // 归一化轨迹(5 点,首尾闭合⇒无缝循环)、图层边长系数、椭圆压比、基础周期(秒)
+    static const CGFloat kTraj[3][10] = {
+        {0.12, 0.02, 0.34, 0.20, 0.18, 0.46, 0.02, 0.22, 0.12, 0.02},  // 蓝:左上→中→下→左
+        {0.92, 0.20, 0.68, 0.08, 0.60, 0.40, 0.88, 0.60, 0.92, 0.20},  // 品红:右上→中→右下
+        {0.42, 1.00, 0.66, 0.80, 0.46, 0.54, 0.18, 0.82, 0.42, 1.00}   // 青:下中→右上→左
+    };
+    static const CGFloat kSideScale[3] = {1.00, 1.10, 0.95};
+    static const CGFloat kSquashX[3]   = {1.00, 1.00, 1.05};
+    static const CGFloat kSquashY[3]   = {0.85, 0.80, 0.90};
+    static const CFTimeInterval kBaseDur[3] = {46.0, 58.0, 52.0};   // 互质般的周期 ⇒ 长时间看不出重复
+
+    CGFloat maxDim = MAX(sz.width, sz.height);
+    for (NSInteger i = 0; i < (NSInteger)_motionBlobLayers.count && i < 3; i++) {
+        CAGradientLayer *b = _motionBlobLayers[i];
+
+        CGFloat side = maxDim * kSideScale[i];
+        b.bounds    = CGRectMake(0, 0, side, side);      // 正方形 ⇒ 径向圆内切
+        b.transform = CATransform3DMakeScale(kSquashX[i], kSquashY[i], 1.0);  // 压成椭圆
+        b.position  = CGPointMake(kTraj[i][0] * sz.width, kTraj[i][1] * sz.height);
+
+        // 缓慢游动(position 关键帧,三次曲线平滑)
+        NSMutableArray<NSValue *> *pts = [NSMutableArray arrayWithCapacity:5];
+        NSMutableArray<NSNumber *> *kts = [NSMutableArray arrayWithCapacity:5];
+        for (NSInteger k = 0; k < 5; k++) {
+            [pts addObject:[NSValue valueWithCGPoint:CGPointMake(kTraj[i][k * 2] * sz.width,
+                                                                 kTraj[i][k * 2 + 1] * sz.height)]];
+            [kts addObject:@((CGFloat)k / 4.0)];
+        }
+        CAKeyframeAnimation *pos = [CAKeyframeAnimation animationWithKeyPath:@"position"];
+        pos.values          = pts;
+        pos.keyTimes        = kts;
+        pos.calculationMode = kCAAnimationCubic;
+        pos.timingFunction  = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        pos.duration        = kBaseDur[i] / speed;
+        pos.repeatCount     = HUGE_VALF;      // 永久循环
+        pos.removedOnCompletion = NO;
+        pos.beginTime       = CACurrentMediaTime();
+        [b addAnimation:pos forKey:@"ameMotionPosition"];
+
+        // 呼吸(opacity,周期与 position 错开 ⇒ 更像极光)
+        CAKeyframeAnimation *opa = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+        opa.values         = @[@0.72, @1.0, @0.70, @0.92, @0.72];
+        opa.keyTimes       = @[@0.0, @0.25, @0.5, @0.75, @1.0];
+        opa.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        opa.duration       = (kBaseDur[i] * 0.62) / speed;
+        opa.repeatCount    = HUGE_VALF;
+        opa.removedOnCompletion = NO;
+        opa.beginTime      = CACurrentMediaTime();
+        [b addAnimation:opa forKey:@"ameMotionOpacity"];
+    }
+}
+
+- (void)ame_removeMotionAnimations {
+    for (CAGradientLayer *b in _motionBlobLayers) {
+        [b removeAnimationForKey:@"ameMotionPosition"];
+        [b removeAnimationForKey:@"ameMotionOpacity"];
+    }
+}
+
+- (void)ame_setMotionLayersHidden:(BOOL)hidden {
+    _motionBaseLayer.hidden = hidden;
+    for (CAGradientLayer *b in _motionBlobLayers) { b.hidden = hidden; }
+}
+
+// CA 标准冻结:把图层时间线钉住 ⇒ 所有子动画(含重复无限循环的)静止,不耗电
+- (void)ame_pauseLayerIfNeeded {
+    if (_motionPaused) { return; }
+    CFTimeInterval pausedTime = [self.layer convertTime:CACurrentMediaTime() fromLayer:nil];
+    self.layer.speed      = 0.0;
+    self.layer.timeOffset = pausedTime;
+    _motionPaused = YES;
+}
+
+// 解冻:按暂停时长平移 beginTime,动画从冻结点无缝续跑
+- (void)ame_resumeLayerIfNeeded {
+    if (!_motionPaused) { return; }
+    CFTimeInterval pausedTime = self.layer.timeOffset;
+    self.layer.speed      = 1.0;
+    self.layer.timeOffset = 0.0;
+    CFTimeInterval timeSincePause = [self.layer convertTime:CACurrentMediaTime() fromLayer:nil] - pausedTime;
+    self.layer.beginTime  = timeSincePause;
+    _motionPaused = NO;
+}
+
+// 状态机:根据 允许(设置/环境) && 未挂起(前台) 决定「跑光效」还是「静态渐变」
+- (void)ame_applyMotionState {
+    BOOL run = (_motionAllowed && !_motionSuspended);
+    if (run) {
+        [self ame_buildMotionLayersIfNeeded];
+        [self ame_applyMotionAppearance];
+        [self ame_setMotionLayersHidden:NO];
+        [self ame_installMotionAnimations];
+        _motionRunning = YES;
+        [self ame_resumeLayerIfNeeded];   // 若之前冻结过,恢复时间线
+    } else {
+        [self ame_removeMotionAnimations];
+        [self ame_setMotionLayersHidden:YES];
+        _motionRunning = NO;
+        [self ame_resumeLayerIfNeeded];   // 解冻,避免静态态被卡住
+    }
+    self.backgroundColor = [UIColor clearColor];
+    [self setNeedsDisplay];               // 切换 drawRect 静态渐变 / 图层光效
+}
+
+- (void)ame_refreshFromSettings {
+    _motionAllowed = [self ame_motionShouldRun];
+    [self ame_applyMotionState];
+}
+
+- (void)ame_setMotionActive:(BOOL)active {
+    _motionSuspended = !active;
+    if (_motionSuspended) {
+        if (_motionRunning) { [self ame_pauseLayerIfNeeded]; }   // 退后台:冻结,不重建
+    } else {
+        [self ame_applyMotionState];                             // 回前台:恢复(必要时重建)
+    }
+}
+
 @end
 
 @interface BackgroundManager ()
@@ -223,6 +449,28 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
                                              selector:@selector(updateBackgroundFrame)
                                                  name:UIApplicationWillChangeStatusBarFrameNotification
                                                object:nil];
+    
+    // ★ [MOTION-BG] 低电量模式变化 / 减弱动态效果变化 ⇒ 重新评估是否降级为静态渐变
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(ame_powerStateChanged)
+                                                 name:NSProcessInfoPowerStateDidChangeNotification
+                                               object:nil];
+    if (@available(iOS 13.0, *)) {
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(ame_reduceMotionChanged)
+                                                     name:UIAccessibilityReduceMotionStatusDidChangeNotification
+                                                   object:nil];
+    }
+}
+
+// ★ [MOTION-BG] 低电量开关变化
+- (void)ame_powerStateChanged {
+    [self ame_refreshDefaultBackgroundMotion];
+}
+
+// ★ [MOTION-BG] 「减弱动态效果」开关变化
+- (void)ame_reduceMotionChanged {
+    [self ame_refreshDefaultBackgroundMotion];
 }
 
 - (void)dealloc {
@@ -318,6 +566,16 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
     if (_glassRimStrength < 0.0 || _glassRimStrength > 1.0) _glassRimStrength = 1.0;
     AmeSetGlassRimStrength(_glassRimEnabled ? _glassRimStrength : 0.0);
 
+    // ★ [MOTION-BG] 流动光效:开关(默认开) + 速度(默认 1.0,区间 0.3…1.6)。
+    //   直接写 ivar,不走 setter ⇒ 启动阶段不触发持久化/刷新(避免 init 期间重入)。
+    id ameMotionObj = [defaults objectForKey:kMotionEnabledKey];
+    _motionBackgroundEnabled = ameMotionObj ? [defaults boolForKey:kMotionEnabledKey] : YES;
+    id ameMotionSObj = [defaults objectForKey:kMotionSpeedKey];
+    _motionBackgroundSpeed = ameMotionSObj ? [defaults floatForKey:kMotionSpeedKey] : 1.0;
+    if (_motionBackgroundSpeed < 0.3 || _motionBackgroundSpeed > 1.6) _motionBackgroundSpeed = 1.0;
+    NSLog(@"[motion-bg] settings loaded: enabled=%d speed=%.2f allowed=%d",
+          (int)_motionBackgroundEnabled, _motionBackgroundSpeed, (int)[self motionBackgroundAllowed]);
+
     NSLog(@"[glass] settings loaded: uiEffect=%ld (0=半透明,1=毛玻璃) blurIntensity=%.2f uiOpacity=%.2f",
           (long)_uiEffect, _blurIntensity, _uiOpacity);
     NSLog(@"[glass] rim: enabled=%d strength=%.2f", (int)self.glassRimEnabled, self.glassRimStrength);
@@ -330,6 +588,8 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
     [defaults setFloat:self.blurIntensity forKey:kBackgroundBlurIntensityKey];
     [defaults setBool:self.glassRimEnabled forKey:kGlassRimEnabledKey];      // ★ [RIM-UI]
     [defaults setFloat:self.glassRimStrength forKey:kGlassRimStrengthKey];   // ★ [RIM-UI]
+    [defaults setBool:self.motionBackgroundEnabled forKey:kMotionEnabledKey];  // ★ [MOTION-BG]
+    [defaults setFloat:self.motionBackgroundSpeed forKey:kMotionSpeedKey];     // ★ [MOTION-BG]
     [defaults synchronize];
 }
 
@@ -369,6 +629,70 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
     [self saveUISettings];
     AmeSetGlassRimStrength(_glassRimEnabled ? _glassRimStrength : 0.0);
     [self applyGlassRimSettingsNow];
+}
+
+#pragma mark - ★ [MOTION-BG] 默认背景流动光效 开关 / 速度 / 降级判定
+//
+// 设置页只负责改这两个属性,持久化 + 即时生效都在这里:
+//   · saveUISettings 落 NSUserDefaults(键 background_motion_enabled / background_motion_speed);
+//   · ame_refreshDefaultBackgroundMotion 找到当前默认背景视图,重载其光效状态。
+// 光效只作用于「默认背景」(未设自定义图/视频),自定义背景路径完全不受影响。
+
+- (void)setMotionBackgroundEnabled:(BOOL)motionBackgroundEnabled {
+    _motionBackgroundEnabled = motionBackgroundEnabled;
+    [self saveUISettings];
+    [self ame_refreshDefaultBackgroundMotion];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"BackgroundUIEffectChanged" object:nil];
+}
+
+- (void)setMotionBackgroundSpeed:(CGFloat)motionBackgroundSpeed {
+    _motionBackgroundSpeed = MAX(0.3, MIN(1.6, motionBackgroundSpeed));   // ★ 夹紧:0.3…1.6
+    [self saveUISettings];
+    [self ame_refreshDefaultBackgroundMotion];
+}
+
+// 允许跑光效的环境判定(集中一处,视图侧只问「allowed」)
+- (BOOL)motionBackgroundAllowed {
+    if (!self.motionBackgroundEnabled) { return NO; }                    // 用户关了
+    if (UIAccessibilityIsReduceMotionEnabled()) { return NO; }           // 减弱动态效果
+    if (@available(iOS 9.0, *)) {
+        if ([NSProcessInfo processInfo].isLowPowerModeEnabled) { return NO; }   // 低电量模式
+    }
+    if ([self ame_isLowEndDevice]) { return NO; }                        // 低端设备
+    return YES;
+}
+
+// 低端设备判定:物理内存 <= 2GiB(≈ iPhone 6s/7/8/SE1 这一档)。
+// 结果缓存,避免每次查询都读进程信息。
+- (BOOL)ame_isLowEndDevice {
+    static BOOL lowEnd = NO;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        unsigned long long mem = [NSProcessInfo processInfo].physicalMemory;
+        lowEnd = (mem > 0 && mem <= (2ULL * 1024ULL * 1024ULL * 1024ULL));
+    });
+    return lowEnd;
+}
+
+// 找到当前宿主上的默认渐变视图并让它重载光效状态。只在默认背景(currentType==None)下有效。
+- (void)ame_refreshDefaultBackgroundMotion {
+    if (self.currentType != BackgroundTypeNone) { return; }
+    UIView *host = self.ameDefaultGradientHost;
+    if (!host) { return; }
+    UIView *g = [host viewWithTag:kDefaultBackgroundTag];
+    if ([g isKindOfClass:[AmeGradientBackgroundView class]]) {
+        [(AmeGradientBackgroundView *)g ame_refreshFromSettings];
+    }
+}
+
+// 前后台:让默认背景视图冻结/恢复光效(仅默认背景视图存在时)
+- (void)ame_setDefaultMotionActive:(BOOL)active {
+    UIView *host = self.ameDefaultGradientHost;
+    if (!host) { return; }
+    UIView *g = [host viewWithTag:kDefaultBackgroundTag];
+    if ([g isKindOfClass:[AmeGradientBackgroundView class]]) {
+        [(AmeGradientBackgroundView *)g ame_setMotionActive:active];
+    }
 }
 
 #pragma mark - Global Background Application
@@ -552,6 +876,8 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
     g.tag = kDefaultBackgroundTag;
     [host insertSubview:g atIndex:0];
     self.ameDefaultGradientHost = host;   // ★ [E3] 弱持有,便于清理
+    // ★ [MOTION-BG] 按当前设置/环境决定「流动光效」还是「静态渐变」
+    [g ame_refreshFromSettings];
     // 兜底底色(与渐变基色一致,避免首帧/渐变外露黑)
     host.backgroundColor = AmeDynamicColor(AmeRGBA(0x10, 0x13, 0x22, 1.0),
                                            AmeRGBA(0xEE, 0xF3, 0xFF, 1.0));
@@ -1192,10 +1518,12 @@ static BOOL gAmeGlassRimApplyScheduled = NO;
 
 - (void)appDidEnterBackground {
     [self pauseVideo];
+    [self ame_setDefaultMotionActive:NO];   // ★ [MOTION-BG] 冻结流动光效(不耗电)
 }
 
 - (void)appWillEnterForeground {
     [self resumeVideo];
+    [self ame_setDefaultMotionActive:YES];  // ★ [MOTION-BG] 恢复流动光效
 }
 
 - (void)pauseVideo {
