@@ -1683,18 +1683,29 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     const char *rendC = getenv("AMETHYST_RENDERER");
     NSString *renderer = rendC ? @(rendC) : @"";
     NSString *rendererLower = renderer.lowercaseString;
-    BOOL rendererIsMetallum = [rendererLower containsString:@"metallum"] ||
+    // ★ [AGENT-GATE-FIX] 不能只读 AMETHYST_RENDERER 判 Metal!
+    //   选了 Metal 时上游会把 AMETHYST_RENDERER 故意改写成 auto(→ANGLE),
+    //   那只为给 Surface 提供 GL 上下文;真正的"我选了 Metal"信号是
+    //   AMETHYST_METAL=1 —— agent 自己也只认这个开关来打开渲染 patch。
+    //   只读 AMETHYST_RENDERER 会把 Metal 误判成 ANGLE ⇒ 跳过 agent ⇒ 渲染 patch
+    //   全关 ⇒ 只能用 ANGLE 渲染 ⇒ MC 26.2 的 flat_clouds/clouds 管线编译失败而崩溃
+    //   (实测 2026-10-03,日志:[AGENT-GATE] 渲染器=libtinygl4angle.dylib ⇒ 跳过)。
+    const char *metalC = getenv("AMETHYST_METAL");
+    BOOL metalFlagOn = (metalC != NULL && strcmp(metalC, "1") == 0);
+    BOOL rendererIsMetallum = metalFlagOn ||
+                              [rendererLower containsString:@"metallum"] ||
                               [rendererLower containsString:@"metal"];
     BOOL wantsMetallumAgent = mcIs26Plus && rendererIsMetallum;
     if (!wantsMetallumAgent) {
-        NSLog(@"[AGENT-GATE] MC=%@(major=%ld) 渲染器=%@ ⇒ %@,跳过 metallum_agent 注入",
+        NSLog(@"[AGENT-GATE] MC=%@(major=%ld) 渲染器=%@ AMETHYST_METAL=%@ ⇒ %@,跳过 metallum_agent 注入",
               launchId, (long)metallumMcMajor, renderer,
+              metalFlagOn ? @"1" : @"(未置)",
               mcIs26Plus ? @"渲染器非 Metal" : @"版本不足 26");
     }
     if (wantsMetallumAgent
         && [fm fileExistsAtPath:[librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
-        NSLog(@"[AGENT-GATE] 注入 metallum_agent(MC=%@ major=%ld 渲染器=%@)",
-              launchId, (long)metallumMcMajor, renderer);
+        NSLog(@"[AGENT-GATE] 注入 metallum_agent(MC=%@ major=%ld 渲染器=%@ AMETHYST_METAL=%@)",
+              launchId, (long)metallumMcMajor, renderer, metalFlagOn ? @"1" : @"(未置)");
         PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
         if (launchId.length > 0) {
             PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", launchId);
