@@ -2025,6 +2025,7 @@
 "jit.wait.stosdebug" = "Enable JIT for this app with StosDebug, then return to the launcher. Waiting up to 30 seconds…";
 "jit.wait.abort.title" = "JIT not available";
 "jit.wait.timeout.message" = "Tried to launch your JIT enabler, but JIT was not ready within 30 seconds, so the launch was canceled. Enable JIT for this app and try again (you can also change the JIT enabler in Settings).";
+"jit.wait.timeout.foreground.message" = "Tried to launch your JIT enabler, but JIT was still not detected after you returned to the launcher (up to 30 seconds of active waiting in the foreground, 180 seconds total). The launch was canceled. Enable JIT for this app and try again (you can also change the JIT enabler in Settings).";
 "jit.wait.blocked.message" = "The JIT debugger is not responding (nothing is servicing the breakpoint). Make sure JIT is enabled in a way that keeps the debugger attached and uses the UniversalJIT26 script, then launch again.";
 "jit.wait.missing.tool" = "No JIT enabler tool was detected. Install or check %@, or change the JIT enabler in Settings, then try again.";
 "jit.wait.missing.generic" = "No JIT enabler tool was detected. Install a JIT tool (TrollStore, StikDebug, SideStore / SideJIT, JitStreamer, …), or change the JIT enabler in Settings, then try again.";

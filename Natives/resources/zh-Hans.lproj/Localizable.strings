@@ -2021,6 +2021,7 @@
 "jit.wait.stosdebug" = "请用 StosDebug 为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
 "jit.wait.abort.title" = "JIT 不可用";
 "jit.wait.timeout.message" = "已尝试为你调起 JIT 使能工具，但 30 秒内未就绪，启动已优雅中止。请为本 App 启用 JIT 后重试（也可在设置里切换 JIT 获取方式）。";
+"jit.wait.timeout.foreground.message" = "已为你调起 JIT 使能工具，但回到前台后仍未检测到 JIT（前台活跃等待共 30 秒、总计最多 180 秒），启动已优雅中止。请为本 App 启用 JIT 后重试（也可在设置里切换 JIT 获取方式）。";
 "jit.wait.blocked.message" = "JIT 调试器未响应（brk 无人服务）。请确认已用带 UniversalJIT26 脚本、且调试器保持附加的方式启用 JIT 后再启动。";
 "jit.wait.missing.tool" = "未检测到 JIT 使能工具。请安装或确认已安装 %@，或在设置里更换 JIT 获取方式后重试。";
 "jit.wait.missing.generic" = "未检测到 JIT 使能工具。请安装一个 JIT 工具（TrollStore、StikDebug、SideStore / SideJIT、JitStreamer 等），或在设置里更换 JIT 获取方式后重试。";

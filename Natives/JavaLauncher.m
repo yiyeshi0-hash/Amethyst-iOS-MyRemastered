@@ -80,6 +80,17 @@ static BOOL ame139_requestJIT(BOOL forceStikJIT);
 //   定义在使用点(launchJVM)之前 ⇒ 无需再写前置声明;改超时只改这一处。
 static const NSTimeInterval kAmeJITWaitTimeout = 30.0;
 
+// ★ [JIT-WAIT2] 前台感知等待的绝对墙上限(秒):活跃预算(30s)只在 App 处于前台时
+//   累计,后台不计时也不放弃;这一道墙上限兜底,防止用户一去不回把启动无限挂住。
+static const NSTimeInterval kAmeJITWaitWallTimeout = 180.0;
+
+// ★ [JIT-WAIT2] 前台感知的 JIT 就绪等待(取代此处原 ame169_waitForJITCondition 调用:
+//   只在 UIApplicationStateActive 时累计时间 + 回前台立刻重判 + 双上限)。定义在本
+//   文件后部(ameJITWaitMessageKeyForEnabler 之后),C 风格「先使用后定义」必须前置声明。
+static BOOL ameJIT2WaitForReadyActive(NSTimeInterval activeTimeout,
+                                      NSTimeInterval wallTimeout,
+                                      NSString *label);
+
 // ★ [JIT-WAIT] 依 debug.jit_enabler 当前值选择「等待 JIT 就绪」提示文案的 i18n 键。
 //   前置声明:定义在本文件后部(ame139_requestJIT 之前),C 风格文件「先使用后定义」必须声明。
 static NSString *ameJITWaitMessageKeyForEnabler(NSString *enabler);
@@ -1100,35 +1111,54 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
                 if (![ameEnabler isKindOfClass:NSString.class] || ameEnabler.length == 0) {
                     ameEnabler = @"auto";
                 }
-                NSLog(@"[JIT-WAIT] requesting JIT via enabler=%@ then waiting up to %.0fs for it to become ready",
-                      ameEnabler, (double)kAmeJITWaitTimeout);
+                NSLog(@"[JIT-WAIT2] requesting JIT via enabler=%@ then waiting up to %.0fs ACTIVE (wall cap %.0fs) for it to become ready",
+                      ameEnabler, (double)kAmeJITWaitTimeout, (double)kAmeJITWaitWallTimeout);
+                // ★ [JIT-WAIT2] 后台任务断言:ame139_requestJIT 会用 stikjit:// 把 App 切到
+                //   后台(用户在 StikDebug 里操作)。不申请后台时间,iOS 会立刻挂起本进程 ⇒
+                //   等待循环停摆,回到前台只剩一个已烧穿的墙钟预算,用户实测误报「没有 JIT」。
+                //   用 UIBackgroundTaskInvalid 哨兵保证 endBackgroundTask 恰好结束一次。
+                UIBackgroundTaskIdentifier ameJIT2_bgt =
+                    [UIApplication.sharedApplication beginBackgroundTaskWithName:@"launch-jit-wait" expirationHandler:^{}];
                 if (!ame139_requestJIT(NO)) {
                     // ★ [JIT-WAIT] 没能调起使能工具(未安装 / 无法打开):requestJIT 已弹出
                     //   「未检测到 JIT 使能工具」+ 按 debug.jit_enabler 的安装提示,直接优雅
-                    //   放弃,不再白等 30 秒。
-                    NSLog(@"[JIT-WAIT] no JIT enabler was launched -- aborting without waiting");
+                    //   放弃,不再白等。
+                    NSLog(@"[JIT-WAIT2] no JIT enabler was launched -- aborting without waiting");
+                    if (ameJIT2_bgt != UIBackgroundTaskInvalid) {
+                        [UIApplication.sharedApplication endBackgroundTask:ameJIT2_bgt];
+                        ameJIT2_bgt = UIBackgroundTaskInvalid;
+                    }
                     [PLLogOutputView handleExitCode:1];
                     return 1;
                 }
                 ameWaitedForJIT = YES;
-                // ③ 轮询「活的调试器是否在岗」(JIT26IsLikelyDebuggerKeepAttached 比单看
-                //    粘滞的 CS_DEBUGGED 准):有界 30s,ame169 自带超时与周期日志。
-                ameJitBecameReady = ame169_waitForJITCondition(^BOOL{
-                    return JIT26IsLikelyDebuggerKeepAttached();
-                }, kAmeJITWaitTimeout, @"launchJVM-jit26");
+                // ③ ★ [JIT-WAIT2] 前台感知等待:只在 App 前台(Active)时累计活跃时间
+                //    (kAmeJITWaitTimeout=30s 活跃预算),后台/冻结不计时也不放弃;监听
+                //    DidBecomeActive,回到前台立刻重判一次,就绪即马上跳出继续启动。
+                //    绝对墙上限 kAmeJITWaitWallTimeout=180s 兜底(防用户一去不回)。
+                ameJitBecameReady = ameJIT2WaitForReadyActive(kAmeJITWaitTimeout,
+                                                              kAmeJITWaitWallTimeout,
+                                                              @"launchJVM-jit26");
+                // ★ [JIT-WAIT2] 等待一结束就释放后台断言(紧接着的重试建区是纯 CPU 活,
+                //   不再需要额外后台时间);哨兵防重复结束。
+                if (ameJIT2_bgt != UIBackgroundTaskInvalid) {
+                    [UIApplication.sharedApplication endBackgroundTask:ameJIT2_bgt];
+                    ameJIT2_bgt = UIBackgroundTaskInvalid;
+                }
                 // 就绪(或超时)后都重试一次;成功则继续原有启动流程。
                 result = JIT26CreateRegionLegacySafe(getpagesize());   // ★ 重试一次(写回 static 缓存)
-                NSLog(@"[JIT-WAIT] retry after wait -> %p (becameReady=%d waited=%d)",
+                NSLog(@"[JIT-WAIT2] retry after wait -> %p (becameReady=%d waited=%d)",
                       result, ameJitBecameReady, ameWaitedForJIT);
             }
 
             // ④ ★ [JIT-WAIT] 超时未就绪 或 就绪了但建区仍失败 ⇒ 才弹框放弃(文案区分两种情况)。
             if (result == NULL) {
-                NSLog(@"[JIT-WAIT] still NULL after request/wait/retry -- aborting launch gracefully (becameReady=%d)",
+                NSLog(@"[JIT-WAIT2] still NULL after request/wait/retry -- aborting launch gracefully (becameReady=%d)",
                       ameJitBecameReady);
                 if (ameWaitedForJIT && !ameJitBecameReady) {
-                    // 超时未就绪:明确「已调起、30s 内未就绪」,并列出可能的方式(不只点名 StikDebug)。
-                    showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.timeout.message", nil));
+                    // ★ [JIT-WAIT2] 超时未就绪:文案强调「已回到前台仍未检测到 JIT」(前台
+                    //   活跃等待窗口耗尽,而非墙钟一刀切),并列出可能的方式(不只点名 StikDebug)。
+                    showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.timeout.foreground.message", nil));
                 } else {
                     // 就绪了但建区仍失败:保留原有关于 UniversalJIT26 / brk 的解释。
                     showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.blocked.message", nil));
@@ -2282,6 +2312,110 @@ static NSString *ameJITWaitMessageKeyForEnabler(NSString *enabler) {
     if ([enabler isEqualToString:@"stosdebug"]) return @"jit.wait.stosdebug";
     if ([enabler isEqualToString:@"stikdebug"] || [enabler isEqualToString:@"stikjit"]) return @"jit.wait.stikdebug";
     return @"jit.wait.auto";
+}
+
+// ★ [JIT-WAIT2] 前台感知的 JIT 就绪等待。
+//   背景(用户实测):没开 JIT 时启动 ⇒ launchJVM 用 stikjit:// 把 App 切到后台去开
+//   JIT,原来这段等待用墙钟一刀切(kAmeJITWaitTimeout=30s):用户在 StikDebug 里花掉
+//   >30s,一回到前台就立刻判定超时 ⇒ 误报「没有 JIT」。本函数取代此处的
+//   ame169_waitForJITCondition 调用,把计时改成「活跃时间」,并保证回前台立即重判:
+//     · 只在 UIApplicationStateActive 时累计时间;后台不计时(也不放弃),只打周期日志;
+//     · 冻结/挂起间隙(墙钟空转 >2s)同样不计入活跃预算;
+//     · 监听 UIApplicationDidBecomeActiveNotification:回到前台立刻再判一次条件
+//       (不必等下一个 200ms 轮询节拍),就绪 ⇒ 立即跳出、由调用方重试建区并继续启动;
+//     · 双上限:活跃预算 activeTimeout + 绝对墙上限 wallTimeout(兜底,防一去不回)。
+//   条件固定用 JIT26IsLikelyDebuggerKeepAttached()(活调试器是否在岗)。
+//   调用方负责持有后台任务断言(beginBackgroundTask),否则 iOS 会立即挂起本循环。
+static BOOL ameJIT2WaitForReadyActive(NSTimeInterval activeTimeout,
+                                      NSTimeInterval wallTimeout,
+                                      NSString *label) {
+    NSString *ameJIT2_tag = label ?: @"JIT";
+    NSDate *ameJIT2_wallStart = [NSDate date];
+    NSDate *ameJIT2_lastIter  = [NSDate date];
+    NSTimeInterval ameJIT2_activeAccum = 0.0;   // 累计活跃秒数(仅前台、无挂起间隙)
+    NSTimeInterval ameJIT2_lastLog = 0.0;       // 上次周期日志的墙上秒(避开对 math.h 的依赖)
+    BOOL ameJIT2_wasActive = (UIApplication.sharedApplication.applicationState == UIApplicationStateActive);
+    BOOL ameJIT2_loggedBgReady = NO;             // 后台探针命中只记一次,避免日志刷屏
+
+    // ★ [JIT-WAIT2] 回前台立即重判:监听 DidBecomeActive 置 ping,循环读到就马上再判
+    //   一次条件。queue:nil ⇒ 在投递线程(主线程)同步执行,不依赖可能被启动流程楔死的
+    //   主队列派发,比 NSOperationQueue mainQueue 更不易丢。
+    __block volatile BOOL ameJIT2_resumePing = NO;
+    id ameJIT2_obs = [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *ameJIT2_note) {
+                    (void)ameJIT2_note;
+                    ameJIT2_resumePing = YES;
+                }];
+
+    NSLog(@"[JIT-WAIT2] %@ wait begin: activeBudget=%.0fs wallCap=%.0fs startForeground=%d",
+          ameJIT2_tag, (double)activeTimeout, (double)wallTimeout, ameJIT2_wasActive);
+
+    BOOL ameJIT2_ready = NO;
+    for (;;) {
+        NSTimeInterval ameJIT2_gap = -[ameJIT2_lastIter timeIntervalSinceNow];
+        ameJIT2_lastIter = [NSDate date];
+        NSTimeInterval ameJIT2_wallNow = -[ameJIT2_wallStart timeIntervalSinceNow];
+        BOOL ameJIT2_active = (UIApplication.sharedApplication.applicationState == UIApplicationStateActive);
+        BOOL ameJIT2_probe = JIT26IsLikelyDebuggerKeepAttached();
+
+        // ① 就绪判定(仅前台接受):每次轮询/回前台 ping 都先判一次条件。后台即便探针
+        //    命中也不在此结束 —— 调用方一旦在后台提前释放后台断言,iOS 可能立刻挂起,
+        //    后面「重试建区 + 继续启动」会被冻住。后台只记录、不计时、不放弃。
+        if (ameJIT2_active && ameJIT2_probe) {
+            NSLog(@"[JIT-WAIT2] %@ condition satisfied in FOREGROUND (active=%.1fs wall=%.1fs) -- continuing launch",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow);
+            ameJIT2_ready = YES;
+            break;
+        }
+        if (!ameJIT2_active && ameJIT2_probe && !ameJIT2_loggedBgReady) {
+            ameJIT2_loggedBgReady = YES;
+            NSLog(@"[JIT-WAIT2] %@ probe already attached but app is in BACKGROUND -- deferring until foreground",
+                  ameJIT2_tag);
+        }
+
+        if (ameJIT2_resumePing) {
+            ameJIT2_resumePing = NO;
+            NSLog(@"[JIT-WAIT2] %@ foreground resume re-check (active=%.1fs wall=%.1fs)",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow);
+        }
+        if (ameJIT2_active != ameJIT2_wasActive) {
+            NSLog(@"[JIT-WAIT2] %@ app %s while waiting (active=%.1fs wall=%.1fs)",
+                  ameJIT2_tag, ameJIT2_active ? "returned to FOREGROUND" : "went to BACKGROUND",
+                  ameJIT2_activeAccum, ameJIT2_wallNow);
+            ameJIT2_wasActive = ameJIT2_active;
+        }
+
+        // ② 活跃时间累计:仅当当前前台 且 本轮无挂起间隙(gap<=2s)才计入。后台/冻结期
+        //    墙钟照走但不算预算 ⇒ 用户开 JIT 花多久都不冤枉。
+        if (ameJIT2_active && ameJIT2_gap <= 2.0) {
+            ameJIT2_activeAccum += ameJIT2_gap;
+        }
+
+        // ③ 双上限。活跃预算只在「当前仍在前台」时才判,保证后台绝不放弃(用户可能还在
+        //    使能工具里操作)。
+        if (wallTimeout > 0.0 && ameJIT2_wallNow >= wallTimeout) {
+            NSLog(@"[JIT-WAIT2] %@ wait hit WALL cap after %.0fs (active=%.1fs) -- giving up",
+                  ameJIT2_tag, ameJIT2_wallNow, ameJIT2_activeAccum);
+            break;
+        }
+        if (ameJIT2_active && activeTimeout > 0.0 && ameJIT2_activeAccum >= activeTimeout) {
+            NSLog(@"[JIT-WAIT2] %@ active budget exhausted after %.1fs active (wall=%.1fs) -- giving up",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow);
+            break;
+        }
+        if (ameJIT2_wallNow - ameJIT2_lastLog >= 10.0) {
+            ameJIT2_lastLog = ameJIT2_wallNow;
+            NSLog(@"[JIT-WAIT2] %@: still waiting (active=%.1fs wall=%.1fs foreground=%d)",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow, ameJIT2_active);
+        }
+        usleep(1000 * 200);
+    }
+
+    [[NSNotificationCenter defaultCenter] removeObserver:ameJIT2_obs];
+    return ameJIT2_ready;
 }
 
 // ★ [JIT-WAIT] 依 debug.jit_enabler 选择「未检测到 JIT 使能工具」提示里的工具名;
