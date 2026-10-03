@@ -23,6 +23,8 @@ static const NSInteger kBackgroundImageTag = 99998;
 static const NSInteger kBackgroundBlurTag = 99997;
 static const NSInteger kBackgroundDimTag = 99996;
 static const NSInteger kDefaultBackgroundTag = 99995;
+// ★ [GLASSUI] 合并同一 runloop 内的多次玻璃重刷(强度滑块连续拖动时避免反复遍历视图树)
+static BOOL gAmeGlassRimApplyScheduled = NO;
 
 #pragma mark - ★ [E3] 默认背景渐变视图(SPEC §2.1:深=紫蓝 / 浅=白→粉紫)
 //
@@ -166,6 +168,9 @@ static const NSInteger kDefaultBackgroundTag = 99995;
 @property (nonatomic, weak) UIView *ameDefaultGradientHost;
 // ★ [E3] 私有:把默认渐变背景挂到宿主(window / splitVC.view)
 - (void)ame_applyDefaultGradientToHost:(UIView *)host;
+// ★ [GLASSUI] 私有:玻璃高光设置即时生效(设置页接入用)
+- (void)applyGlassRimSettingsNow;
+- (void)ameApplyGlassRimSettingsToViewTree:(UIView *)root;
 @end
 
 @implementation BackgroundManager
@@ -341,6 +346,29 @@ static const NSInteger kDefaultBackgroundTag = 99995;
 - (void)setBlurIntensity:(CGFloat)blurIntensity {
     _blurIntensity = MAX(0.0, MIN(1.0, blurIntensity));
     [self saveUISettings];
+}
+
+#pragma mark - ★ [GLASSUI] 玻璃高光 开关 / 强度(设置页接入:夹紧 + 持久化 + 即时生效)
+//
+// 说明:glassRimEnabled / glassRimStrength 原本只有自动合成的访问器 —— 外部直接赋值既不会
+// 写进 NSUserDefaults,也不会写进 UIKit+GlassSurface.h 里的全局强度变量 gAmeGlassRimStrength。
+// 这里补显式 setter,复用【既有】键(background_glass_rim_enabled / background_glass_rim_strength,
+// 见本文件顶部常量),不新增第二套键/第二套实现:
+//   ① 夹紧到合法区间;② saveUISettings 持久化;③ AmeSetGlassRimStrength 写全局强度(关 ⇒ 0);
+//   ④ applyGlassRimSettingsNow 立即重刷屏幕上所有已挂高光的载体(即时生效)。
+// 载入路径(init 里直写 _glassRimEnabled / _glassRimStrength 两个 ivar)不经过 setter ⇒ 启动不会触发重刷。
+- (void)setGlassRimEnabled:(BOOL)glassRimEnabled {
+    _glassRimEnabled = glassRimEnabled;
+    [self saveUISettings];
+    AmeSetGlassRimStrength(_glassRimEnabled ? _glassRimStrength : 0.0);
+    [self applyGlassRimSettingsNow];
+}
+
+- (void)setGlassRimStrength:(CGFloat)glassRimStrength {
+    _glassRimStrength = MAX(0.0, MIN(1.0, glassRimStrength));   // ★ 夹紧:0…1,越界不入
+    [self saveUISettings];
+    AmeSetGlassRimStrength(_glassRimEnabled ? _glassRimStrength : 0.0);
+    [self applyGlassRimSettingsNow];
 }
 
 #pragma mark - Global Background Application
@@ -1319,5 +1347,44 @@ static const NSInteger kDefaultBackgroundTag = 99995;
     if (!v) return;
     AmeRefreshGlassRim(v);
     for (UIView *sub in v.subviews) { [self ameRefreshRimsRecursive:sub]; }
+}
+
+#pragma mark - ★ [GLASSUI] 玻璃高光设置即时生效
+
+// 遍历视图树:只对「已经挂了高光图层(tag 'MRIM')」的载体做摘除 + 按当前开关/强度重建。
+// 关 ⇒ AmeDetachGlassRim 摘掉;开 ⇒ AmeAttachGlassRim 按新强度重建(内部先查强度,0 也不刷)。
+// 主路径(applyEffectToView:)与其它文件自挂的高光都会在这里被按新强度重建。
+- (void)ameApplyGlassRimSettingsToViewTree:(UIView *)root {
+    if (root == nil) { return; }
+    static const NSInteger kAmeGlassRimTag = 0x4D52494D;   // 'MRIM',与 UIKit+GlassSurface.h 一致
+    BOOL hasRim = NO;
+    for (UIView *sub in root.subviews) {
+        if (sub.tag == kAmeGlassRimTag) { hasRim = YES; break; }
+    }
+    if (hasRim) {
+        AmeSetGlassRimStrength(self.glassRimEnabled ? self.glassRimStrength : 0.0);
+        AmeDetachGlassRim(root);                                // ★ 摘除(禁用函数)
+        if (self.glassRimEnabled && self.glassRimStrength > 0.001) {
+            AmeAttachGlassRim(root, root.layer.cornerRadius);   // ★ 恢复/按新强度重建
+        }
+        AmeRefreshGlassRim(root);
+    }
+    for (UIView *sub in [root.subviews copy]) {
+        [self ameApplyGlassRimSettingsToViewTree:sub];
+    }
+}
+
+// 立即把当前开关/强度刷到所有窗口上(合并同一 runloop 的重复调用),并广播通知让各页重新应用。
+- (void)applyGlassRimSettingsNow {
+    AmeSetGlassRimStrength(self.glassRimEnabled ? self.glassRimStrength : 0.0);
+    if (gAmeGlassRimApplyScheduled) { return; }   // ★ 本 runloop 已排队 ⇒ 合并,不重复遍历
+    gAmeGlassRimApplyScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gAmeGlassRimApplyScheduled = NO;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            [self ameApplyGlassRimSettingsToViewTree:w];
+        }
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"BackgroundUIEffectChanged" object:nil];
+    });
 }
 @end

@@ -1991,3 +1991,7 @@
 "update_dialog.update" = "Update";
 "preference.title.auto_check_update" = "Check for Updates on Launch";
 "preference.detail.auto_check_update" = "Automatically check GitHub Releases when the launcher starts. At most once per hour; versions you chose to ignore are not shown again.";
+
+// ★ [GLASSUI] glass effect (switch + strength slider)
+"preference.title.glass_effect" = "Glass Effect";
+"preference.title.glass_strength" = "Glass Strength";

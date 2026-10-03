@@ -1984,3 +1984,7 @@
 "update_dialog.update" = "更新";
 "preference.title.auto_check_update" = "啟動時檢查更新";
 "preference.detail.auto_check_update" = "啟動啟動器時自動檢查 GitHub Releases。每小時最多檢查一次，被你選擇忽略的版本將不再提示。";
+
+// ★ [GLASSUI] glass effect (switch + strength slider)
+"preference.title.glass_effect" = "玻璃效果";
+"preference.title.glass_strength" = "玻璃强度";
