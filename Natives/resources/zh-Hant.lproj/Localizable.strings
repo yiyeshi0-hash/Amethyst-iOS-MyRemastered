@@ -1997,10 +1997,6 @@
 "preference.title.glass_effect" = "玻璃效果";
 "preference.title.glass_strength" = "玻璃强度";
 
-// ★ [MOTION-BG] 預設背景流動光效(開關 + 速度滑桿)
-"preference.title.motion_effect" = "流動光效";
-"preference.title.motion_speed" = "流動速度";
-
 // ★ [LANG-SWITCH] 啟動器介面語言切換(跟隨系統 + 自動列舉 .lproj)
 "preference.title.launcher_language" = "語言";
 "preference.lang.title" = "語言";

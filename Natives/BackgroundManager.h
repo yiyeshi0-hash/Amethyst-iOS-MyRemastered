@@ -77,15 +77,6 @@ typedef NS_ENUM(NSInteger, BackgroundUIEffect) {
 /// ★ [RIM-UI] 高光强度 0…1(默认 1.0;设置页可调,0 等于关)
 @property(nonatomic, assign) CGFloat glassRimStrength;
 
-// ★ [MOTION-BG] 默认背景「流动光效」(对标 ShardLauncher 的缓慢流光)
-//   仅当未设自定义背景图/视频(currentType == BackgroundTypeNone)时生效;
-//   开关/速度用 NSUserDefaults 持久化(键 background_motion_enabled / background_motion_speed)。
-@property (nonatomic, assign) BOOL motionBackgroundEnabled;    // 默认 YES
-@property (nonatomic, assign) CGFloat motionBackgroundSpeed;   // 0.3…1.6,默认 1.0(越大越快)
-/// ★ [MOTION-BG] 当前环境是否允许跑光效:
-///   开关打开 && 未开「减弱动态效果」&& 非低电量模式 && 非低端(<=2GB)设备。任一不满足即降为静态渐变。
-- (BOOL)motionBackgroundAllowed;
-
 - (void)applyEffectToView:(UIView *)view;
 - (void)applyEffectToCollectionViewCell:(UICollectionViewCell *)cell;
 - (void)applyEffectToCell:(UITableViewCell *)cell;
