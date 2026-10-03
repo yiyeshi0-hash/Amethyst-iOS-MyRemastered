@@ -209,6 +209,19 @@ void openLink(UIViewController* sender, NSURL* link);
 void handle_fatal_exit(int code);
 
 NSString* localize(NSString* key, NSString* comment);
+
+// ★ [LANG-SWITCH] 启动器界面语言覆盖（独立于系统 AppleLanguages）：
+// 用户在「设置 > 语言」里选择后写入 NSUserDefaults（键名 ame_launcher_language），
+// localize() 会优先用它对应的 <lang>.lproj 包，取不到再回退系统语言。
+extern NSString * const AmeLauncherLanguageDefaultsKey;
+/// 用户选择的语言代码（如 @"zh-Hans"）；返回 nil 表示「跟随系统」。
+NSString *AmeLauncherPreferredLanguageOverride(void);
+/// 写入/清除语言覆盖。code 为 nil 或空串时清除（回到跟随系统）。
+void AmeLauncherSetPreferredLanguageOverride(NSString *code);
+/// 语言代码 → 人读显示名（用系统当前语言本地化）；取不到时回退返回 code 本身。
+NSString *AmeLauncherDisplayNameForLanguageCode(NSString *code);
+/// 枚举 App 包内实际存在 .lproj 且带 Localizable.strings 的语言代码（不含 Base），按显示名排序。
+NSArray<NSString *> *AmeLauncherAvailableLanguageCodes(void);
 // YES 表示 NSError 是"当前没有可用网络"，而非服务器返回了不喜欢的内容。
 // 账户刷新只认 NSURLErrorDataNotAllowed 会漏掉飞行模式/无 Wi-Fi 等常见离线形态。
 BOOL isConnectivityError(NSError *error);

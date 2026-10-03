@@ -1996,3 +1996,13 @@
 // ★ [GLASSUI] glass effect (switch + strength slider)
 "preference.title.glass_effect" = "Glass Effect";
 "preference.title.glass_strength" = "Glass Strength";
+
+// ★ [LANG-SWITCH] launcher language switch (follow system + auto-enumerated .lproj)
+"preference.title.launcher_language" = "Language";
+"preference.lang.title" = "Language";
+"preference.lang.follow_system" = "Follow System";
+"preference.lang.section.system" = "System";
+"preference.lang.section.available" = "Available Languages";
+"preference.lang.search_placeholder" = "Search languages";
+"preference.lang.restart_hint.title" = "Language Changed";
+"preference.lang.restart_hint.message" = "The interface has been refreshed to the new language. If a few screens still show the old language, restart the launcher for them to take full effect.";

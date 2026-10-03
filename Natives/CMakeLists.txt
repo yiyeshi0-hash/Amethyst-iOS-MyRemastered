@@ -483,6 +483,7 @@ add_executable(AngelAuraAmethyst
   DownloadViewController.m
   LauncherPreferences.m
   LauncherPreferencesViewController.m
+  LauncherLanguageViewController.m   # ★ [LANG-SWITCH] 语言选择子页(跟随系统 + 枚举 .lproj)
   LauncherPrefContCfgViewController.m
   LauncherPrefGameDirViewController.m
   LauncherPrefManageJREViewController.m

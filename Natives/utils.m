@@ -102,7 +102,89 @@ NSError* saveJSONToFile(NSDictionary *dict, NSString *path) {
     return nil;
 }
 
+// ★ [LANG-SWITCH] 启动器界面语言覆盖：持久化键。
+// 刻意与系统的 AppleLanguages 分开——那是全局键，会牵动 App 内所有 bundle 的语言
+// 选择，也不适合作为「跟随系统 / 指定语言」这种应用内偏好的保存位置。
+NSString * const AmeLauncherLanguageDefaultsKey = @"ame_launcher_language";
+
+// ★ [LANG-SWITCH] 读取用户选择；空串与 nil 一律视为「跟随系统」。
+NSString *AmeLauncherPreferredLanguageOverride(void) {
+    NSString *code = [[NSUserDefaults standardUserDefaults] stringForKey:AmeLauncherLanguageDefaultsKey];
+    return (code.length > 0) ? code : nil;
+}
+
+// ★ [LANG-SWITCH] 写入/清除覆盖。code 为 nil 或空串时清除（回到跟随系统）。
+void AmeLauncherSetPreferredLanguageOverride(NSString *code) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (code.length > 0) {
+        [defaults setObject:code forKey:AmeLauncherLanguageDefaultsKey];
+    } else {
+        [defaults removeObjectForKey:AmeLauncherLanguageDefaultsKey];
+    }
+    [defaults synchronize];
+}
+
+// ★ [LANG-SWITCH] 语言代码 → 人读显示名，用系统当前语言本地化（NSLocale）：
+// 例如系统为中文时 zh-Hans → 「简体中文」，系统为英文时 → 「Chinese, Simplified」。
+NSString *AmeLauncherDisplayNameForLanguageCode(NSString *code) {
+    if (code.length == 0) return @"";
+    NSLocale *displayLocale = [NSLocale currentLocale];
+    NSString *name = [displayLocale localizedStringForLanguageCode:code];
+    return name.length > 0 ? name : code;
+}
+
+// ★ [LANG-SWITCH] 自动枚举 App 包里实际存在的 .lproj（不手写死清单）：
+// 构建时 `cp -R Natives/resources/*` 会把各 <lang>.lproj 拷进 bundle，
+// 这里以资源目录为准；只保留确实带 Localizable.strings 的语言，避免列出空壳目录。
+NSArray<NSString *> *AmeLauncherAvailableLanguageCodes(void) {
+    NSMutableArray<NSString *> *codes = [NSMutableArray array];
+    NSString *resourcePath = [NSBundle mainBundle].resourcePath;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *entry in [fm contentsOfDirectoryAtPath:resourcePath error:nil]) {
+        if (![entry.pathExtension isEqualToString:@"lproj"]) continue;
+        NSString *code = [entry stringByDeletingPathExtension];
+        if (code.length == 0 || [code isEqualToString:@"Base"]) continue;
+        NSString *stringsPath = [resourcePath stringByAppendingPathComponent:
+                                 [entry stringByAppendingPathComponent:@"Localizable.strings"]];
+        if (![fm fileExistsAtPath:stringsPath]) continue;
+        [codes addObject:code];
+    }
+    // 按系统语言下的显示名排序，列表更符合直觉。
+    [codes sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        return [AmeLauncherDisplayNameForLanguageCode(a) localizedCaseInsensitiveCompare:
+                AmeLauncherDisplayNameForLanguageCode(b)];
+    }];
+    return codes;
+}
+
+// ★ [LANG-SWITCH] 缓存当前覆盖语言对应的 lproj bundle，避免每次取词都查磁盘。
+// 语言变更时（键值不同）自动重建，所以切换语言无需重启即可生效。
+static NSString *sAmeLocalizedLangCode = nil;
+static NSBundle *sAmeLocalizedLangBundle = nil;
+
 NSString* localize(NSString* key, NSString* comment) {
+    // ★ [LANG-SWITCH] 优先使用用户在「设置 > 语言」里选择的语言包（自定义键持久化）。
+    // 取不到（未设置 / 资源缺失 / 该 key 在目标语言里没定义）再回退下面的原有逻辑。
+    NSString *override = AmeLauncherPreferredLanguageOverride();
+    if (override.length > 0) {
+        if (![override isEqualToString:sAmeLocalizedLangCode]) {
+            NSString *path = [[NSBundle mainBundle] pathForResource:override ofType:@"lproj"];
+            sAmeLocalizedLangCode = override;
+            sAmeLocalizedLangBundle = path ? [NSBundle bundleWithPath:path] : nil;
+        }
+        if (sAmeLocalizedLangBundle) {
+            NSString *overridden = [sAmeLocalizedLangBundle localizedStringForKey:key value:nil table:nil];
+            if (overridden && ![overridden isEqualToString:key]) {
+                return overridden;
+            }
+        }
+    } else {
+        // 跟随系统：清掉覆盖缓存，保证下次选择语言时重新建包。
+        sAmeLocalizedLangCode = nil;
+        sAmeLocalizedLangBundle = nil;
+    }
+
+    // —— 以下为原有回退逻辑（未改动语义）——
     NSString *value = NSLocalizedString(key, nil);
     if (![NSLocale.preferredLanguages[0] isEqualToString:@"en"] && [value isEqualToString:key]) {
         NSString* path = [NSBundle.mainBundle pathForResource:@"en" ofType:@"lproj"];

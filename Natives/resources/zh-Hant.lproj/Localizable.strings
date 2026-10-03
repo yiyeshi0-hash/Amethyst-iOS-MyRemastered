@@ -1988,3 +1988,13 @@
 // ★ [GLASSUI] glass effect (switch + strength slider)
 "preference.title.glass_effect" = "玻璃效果";
 "preference.title.glass_strength" = "玻璃强度";
+
+// ★ [LANG-SWITCH] 啟動器介面語言切換(跟隨系統 + 自動列舉 .lproj)
+"preference.title.launcher_language" = "語言";
+"preference.lang.title" = "語言";
+"preference.lang.follow_system" = "跟隨系統";
+"preference.lang.section.system" = "系統";
+"preference.lang.section.available" = "可用語言";
+"preference.lang.search_placeholder" = "搜尋語言";
+"preference.lang.restart_hint.title" = "語言已切換";
+"preference.lang.restart_hint.message" = "介面已依新語言重新整理。若個別頁面仍顯示舊語言，請重新啟動啟動器讓其完全生效。";
