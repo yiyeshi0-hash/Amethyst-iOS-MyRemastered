@@ -70,6 +70,9 @@ BOOL validateVirtualMemorySpace(size_t size) {
 // 前向声明：handler 需要在定义之前引用内存采样与镜像 dump。
 static void ameCrashSampleMemLocked(const char *tag);
 static void ameCrashDumpImagesFrom(uint32_t start);
+// ★ [JIT-ENABLE-ACTION] 前置声明:定义在本文件后部(2161 行)。C 风格文件里"先使用后定义"必须声明,
+//   否则报 call to undeclared function(本项目踩过)。
+static void ame139_requestJIT(BOOL forceStikJIT);
 
 static int gAmeCrashFd = -1;
 // 已 dump 过的镜像数量（后台采样线程增量追加用）。必须定义在 handler 之前：
@@ -1031,8 +1034,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         static void *result;
         if(!result) result = JIT26CreateRegionLegacySafe(getpagesize());
         if (result == NULL) {
-            NSLog(@"[JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk; aborting launch gracefully");
-            showDialog(localize(@"Error", nil), @"JIT 调试器未响应（brk 无人服务）。请确认已用带 UniversalJIT26 脚本的方式启用 JIT 后再启动。\nJIT debugger is not responding. Enable JIT with the UniversalJIT26 script and try again.");
+            NSLog(@"[JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk; requesting JIT then aborting launch");
+            // ★ [JIT-ENABLE-ACTION] 原来是死胡同:只弹一句"请确认已用带 UniversalJIT26 脚本的方式
+            //   启用 JIT"就 return。但无 TrollStore 的普通侧载设备(iPadOS 26:no-sandbox=NO、
+            //   expanded-virtual-addressing=NO)根本没有自建 JIT 的路,用户看到这句话也无从下手 ——
+            //   实测日志(iPad Air 5 / iPadOS 26.6.1):
+            //     [JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk
+            //   改为复用 headless 安装器那条已验证的路:ame139_requestJIT 会按偏好(默认 auto ⇒
+            //   stikjit/sidestore/trollstore/stosdebug 等)打开使能 URL 并弹等待说明;
+            //   用户启用 JIT 后重新启动游戏即可。只改失败分支,成功路径一行未动。
+            ame139_requestJIT(NO);
             [PLLogOutputView handleExitCode:1];
             return 1;
         }
