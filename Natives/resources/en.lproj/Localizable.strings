@@ -658,6 +658,14 @@
 "launch.cancel_confirm_message" = "Canceling will terminate the current game loading process and return to the launcher.";
 "launch.cancel_confirm_yes" = "Cancel";
 "launch.cancel_confirm_no" = "Keep waiting";
+"launch.progress.stage.prepare_env" = "Preparing environment...";
+"launch.progress.stage.jit_ready" = "Preparing JIT...";
+"launch.progress.stage.renderer" = "Resolving renderer & graphics API...";
+"launch.progress.stage.runtime" = "Loading runtime (Java / memory)...";
+"launch.progress.stage.args_ready" = "Assembling launch arguments...";
+"launch.progress.stage.jvm_starting" = "Starting Java VM...";
+"launch.progress.stage.waiting_first_frame" = "Waiting for the game window...";
+"launch.progress.stage.completed" = "Launch complete";
 
 // AI Fix Feature
 "ai.fix.conversation" = "Conversation";

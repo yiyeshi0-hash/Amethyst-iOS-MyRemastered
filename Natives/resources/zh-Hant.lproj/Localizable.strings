@@ -652,6 +652,14 @@
 "launch.cancel_confirm_message" = "取消启动将终止当前的游戏加载流程并返回启动器。";
 "launch.cancel_confirm_yes" = "确认取消";
 "launch.cancel_confirm_no" = "继续等待";
+"launch.progress.stage.prepare_env" = "正在準備環境...";
+"launch.progress.stage.jit_ready" = "正在準備 JIT...";
+"launch.progress.stage.renderer" = "正在解析渲染器與圖形 API...";
+"launch.progress.stage.runtime" = "正在載入執行環境(Java / 記憶體)...";
+"launch.progress.stage.args_ready" = "正在組裝啟動參數...";
+"launch.progress.stage.jvm_starting" = "正在啟動 Java 虛擬機...";
+"launch.progress.stage.waiting_first_frame" = "正在等待遊戲畫面...";
+"launch.progress.stage.completed" = "啟動完成";
 
 // AI Fix Feature
 "ai.fix.conversation" = "对话窗口";

@@ -635,6 +635,14 @@
 "launch.cancel_confirm_message" = "Canceling will terminate the current game loading process and return to the launcher.";
 "launch.cancel_confirm_yes" = "Cancel";
 "launch.cancel_confirm_no" = "Keep waiting";
+"launch.progress.stage.prepare_env" = "正在准备环境...";
+"launch.progress.stage.jit_ready" = "正在准备 JIT...";
+"launch.progress.stage.renderer" = "正在解析渲染器与图形 API...";
+"launch.progress.stage.runtime" = "正在加载运行环境(Java / 内存)...";
+"launch.progress.stage.args_ready" = "正在组装启动参数...";
+"launch.progress.stage.jvm_starting" = "正在启动 Java 虚拟机...";
+"launch.progress.stage.waiting_first_frame" = "正在等待游戏画面...";
+"launch.progress.stage.completed" = "启动完成";
 
 // AI Fix Feature
 "ai.fix.conversation" = "Conversation";

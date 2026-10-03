@@ -510,6 +510,8 @@ add_executable(AngelAuraAmethyst
   input_bridge_v3.m
   ios_uikit_bridge.m
   utils.m
+  # ★ [LAUNCH-PROGRESS] 启动阶段上报 API(供 JavaLauncher / SurfaceViewController 调用)
+  AmeLaunchProgress.m
 
   # Version card cell (used by DownloadViewController)
   VersionCardCell.m

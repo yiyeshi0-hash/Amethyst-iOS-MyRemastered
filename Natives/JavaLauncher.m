@@ -36,6 +36,8 @@
 #import "LauncherPreferences.h"
 #import "PLLogOutputView.h"
 #import "PLProfiles.h"
+// ★ [LAUNCH-PROGRESS] 启动阶段上报(遮罩进度条/阶段文字/步骤骨架的数据源)
+#import "AmeLaunchProgress.h"
 
 #define fm NSFileManager.defaultManager
 
@@ -1009,6 +1011,8 @@ static void ame99_installAppKitMenuStubs(void) {
 
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
+    // ★ [LAUNCH-PROGRESS] 阶段1/8：准备环境(默认环境/自定义环境变量/崩溃捕获武装…)
+    AmeLaunchProgressSetStage(AmeLaunchStagePrepareEnv);
 
     // 防御检查：headless JVM（Forge/NeoForge 直装 processors 阶段）已在当前进程
     // 创建过 JVM。进程内 JVM 只能创建一次，再次 JLI_Launch 必然崩溃。
@@ -1159,6 +1163,10 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
     }
 
+    // ★ [LAUNCH-PROGRESS] 阶段2/8：JIT 就绪(建区 + 挂 UniversalJIT26 脚本)。
+    //   非 iOS26 / 无需 Debug JIT Mapping 时上面整块被跳过，这里等价于「本步已过」。
+    AmeLaunchProgressSetStage(AmeLaunchStageJITReady);
+
     if (!requiresDebugJITMapping || jit26AlwaysAttached) {
         if (jit26AlwaysAttached) {
             // Only allow StikDebug to catch our breakpoints to prevent any stutters
@@ -1229,6 +1237,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             renderer = @"auto";
         }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
+        // ★ [LAUNCH-PROGRESS] 阶段3/8：渲染器与图形 API(渲染器已解析，graphicsApi 紧随其后)
+        AmeLaunchProgressSetStage(AmeLaunchStageRenderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 
         // Apply Zink-specific environment variables if Zink renderer is selected
@@ -1468,6 +1478,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     // Task141：启动内存单一事实源（见 ame141_currentLaunchAllocMem）。
     int allocmem = ame141_currentLaunchAllocMem();
     NSLog(@"[JavaLauncher] Max RAM allocation is set to %d MB", allocmem);
+    // ★ [LAUNCH-PROGRESS] 阶段4/8：运行环境(Java 已定位 + JAVA_HOME 已设 + 内存已定)
+    AmeLaunchProgressSetStage(AmeLaunchStageRuntime);
     if (!validateVirtualMemorySpace(allocmem)) {
         UIKit_returnToSplitView();
         if (getEntitlementValue(@"com.apple.developer.kernel.increased-memory-limit")) {
@@ -2144,6 +2156,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
     NSString *lwjglDir = [NSString stringWithFormat:@"%@/lwjgl-%@", librariesPath, lwjglVersion];
     NSLog(@"[JavaLauncher] Using LWJGL jar at %@/lwjgl.jar", lwjglDir);
+    // ★ [LAUNCH-PROGRESS] 阶段5/8：组装启动参数(渲染器/JVM flags/LWJGL/margv 已备齐)
+    AmeLaunchProgressSetStage(AmeLaunchStageArgsReady);
 
     // 校验目标 LWJGL 目录是否存在，避免静默崩溃。
     // 注意：lwjgl-<ver>/ 是目录，不能用带 "/*" 的 classpath 条目做存在性判断。
@@ -2211,6 +2225,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     ame99_installAppKitMenuStubs();
 
     NSLog(@"[Init] Calling JLI_Launch");
+    // ★ [LAUNCH-PROGRESS] 阶段6/8：启动 JVM(JLI_Launch 即将接管启动线程)
+    AmeLaunchProgressSetStage(AmeLaunchStageJVMStarting);
 
     // Cr4shed known issue: exit after crash dump,
     // reset signal handler so that JVM can catch them
@@ -2225,6 +2241,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
     // 标记进程内 JVM 已创建（此后任何 JLI_Launch 都会崩溃，需重启 app）
     gJvmUsedInProcess = YES;
+
+    // ★ [LAUNCH-PROGRESS] 阶段7/8：等待游戏画面。
+    //   JLI_Launch 起 JVM 后本线程即阻塞在这个调用里，直到 MC 出首帧
+    //   (egl_bridge 的 PojavFirstFrameRendered 会把阶段推到「完成」并撤遮罩)。
+    AmeLaunchProgressSetStage(AmeLaunchStageWaitingFirstFrame);
 
     return pJLI_Launch(++margc, margv,
                    0, NULL, // sizeof(const_jargs) / sizeof(char *), const_jargs,
