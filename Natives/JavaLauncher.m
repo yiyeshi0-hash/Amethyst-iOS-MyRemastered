@@ -72,7 +72,15 @@ static void ameCrashSampleMemLocked(const char *tag);
 static void ameCrashDumpImagesFrom(uint32_t start);
 // ★ [JIT-ENABLE-ACTION] 前置声明:定义在本文件后部(2161 行)。C 风格文件里"先使用后定义"必须声明,
 //   否则报 call to undeclared function(本项目踩过)。
-static void ame139_requestJIT(BOOL forceStikJIT);
+static BOOL ame139_requestJIT(BOOL forceStikJIT);
+
+// ★ [JIT-WAIT] launchJVM 失败分支「调起使能工具 → 等就绪 → 重试一次」的等待上限(秒)。
+//   定义在使用点(launchJVM)之前 ⇒ 无需再写前置声明;改超时只改这一处。
+static const NSTimeInterval kAmeJITWaitTimeout = 30.0;
+
+// ★ [JIT-WAIT] 依 debug.jit_enabler 当前值选择「等待 JIT 就绪」提示文案的 i18n 键。
+//   前置声明:定义在本文件后部(ame139_requestJIT 之前),C 风格文件「先使用后定义」必须声明。
+static NSString *ameJITWaitMessageKeyForEnabler(NSString *enabler);
 
 static int gAmeCrashFd = -1;
 // 已 dump 过的镜像数量（后台采样线程增量追加用）。必须定义在 handler 之前：
@@ -1034,18 +1042,96 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         static void *result;
         if(!result) result = JIT26CreateRegionLegacySafe(getpagesize());
         if (result == NULL) {
-            NSLog(@"[JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk; requesting JIT then aborting launch");
+            NSLog(@"[JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk; requesting JIT and waiting before aborting launch");
             // ★ [JIT-ENABLE-ACTION] 原来是死胡同:只弹一句"请确认已用带 UniversalJIT26 脚本的方式
             //   启用 JIT"就 return。但无 TrollStore 的普通侧载设备(iPadOS 26:no-sandbox=NO、
             //   expanded-virtual-addressing=NO)根本没有自建 JIT 的路,用户看到这句话也无从下手 ——
             //   实测日志(iPad Air 5 / iPadOS 26.6.1):
             //     [JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk
             //   改为复用 headless 安装器那条已验证的路:ame139_requestJIT 会按偏好(默认 auto ⇒
-            //   stikjit/sidestore/trollstore/stosdebug 等)打开使能 URL 并弹等待说明;
-            //   用户启用 JIT 后重新启动游戏即可。只改失败分支,成功路径一行未动。
-            ame139_requestJIT(NO);
-            [PLLogOutputView handleExitCode:1];
-            return 1;
+            //   stikjit/sidestore/trollstore/stosdebug 等)打开使能 URL 并弹等待说明。
+            //
+            // ★ [JIT-WAIT] 但「只调起、不等待、立刻 return」仍会崩:ame139_requestJIT 只是用
+            //   openURL 把活交给外部工具(StikDebug 等),调起之后没等调试器真的就岗。此时继续
+            //   往下走,后续 brk(尤其 Natives/dyld_bypass_validation.m 里那几处未包安全网的
+            //   裸 brk)无人服务 ⇒ SIGTRAP 硬崩。用户原话:「把你拉去 StikDebug 要让启动器等待
+            //   一下,不然会直接崩」。
+            //   现语义 = ① 先判「是否已经就绪」→ ② 调起使能工具 → ③ 等就绪(30s 上限) →
+            //   ④ 重试一次;成功则【继续原有启动流程】,只有超时/重试仍失败才优雅放弃。
+            //   成功路径一行未动,只重写这段失败分支。
+            BOOL ameSkipWait = getPrefBool(@"debug.debug_skip_wait_jit");
+            if (ameSkipWait) {
+                // ★ [JIT-WAIT] 保留 debug_skip_wait_jit 偏好语义(别的路径也在用):用户显式要求
+                //   「不要等待 JIT」⇒ 按原样只调起、不新增等待、不重试。
+                NSLog(@"[JIT-WAIT] debug_skip_wait_jit set -- keeping legacy behavior (request JIT, no wait/retry)");
+                ame139_requestJIT(NO);
+                [PLLogOutputView handleExitCode:1];
+                return 1;
+            }
+
+            // ① ★ [JIT-WAIT] 先判「JIT 是否已经就绪」:已就绪就直接重试建区并继续,不白跳一次
+            //    外部 App。覆盖 dynamic-codesigning / jailbroken / no-sandbox(TrollStore 自建
+            //    JIT),以及调试器仍在岗(ptrace / 任务级异常端口)。
+            //    若这次直接重试仍失败 ⇒ 说明只是粘滞的 CS_DEBUGGED 残留(调试器已离场),
+            //    下面照常调起使能工具并等待,不把这类用户挡在开始之前。
+            BOOL ameAlreadyReady = isJITEnabled(NO)
+                || JIT26IsLikelyDebuggerKeepAttached()
+                || getEntitlementValue(@"com.apple.private.security.no-sandbox");
+            if (ameAlreadyReady) {
+                NSLog(@"[JIT-WAIT] JIT already reports ready (isJITEnabled=%d keepAttached=%d) -- retrying region without launching any enabler",
+                      isJITEnabled(NO), JIT26IsLikelyDebuggerKeepAttached());
+                result = JIT26CreateRegionLegacySafe(getpagesize());   // ★ 重试一次(写回 static 缓存)
+                if (result != NULL) {
+                    NSLog(@"[JIT-WAIT] direct retry succeeded (%p) -- continuing launch without an enabler", result);
+                } else {
+                    NSLog(@"[JIT-WAIT] direct retry still NULL -- sticky CS_DEBUGGED; falling through to enabler + bounded wait");
+                }
+            }
+
+            // ② ★ [JIT-WAIT] 仍未就绪:调起使能工具(按 debug.jit_enabler,默认 auto),再等就绪。
+            BOOL ameWaitedForJIT = NO;
+            BOOL ameJitBecameReady = NO;
+            if (result == NULL) {
+                NSString *ameEnabler = getPrefObject(@"debug.jit_enabler");
+                if (![ameEnabler isKindOfClass:NSString.class] || ameEnabler.length == 0) {
+                    ameEnabler = @"auto";
+                }
+                NSLog(@"[JIT-WAIT] requesting JIT via enabler=%@ then waiting up to %.0fs for it to become ready",
+                      ameEnabler, (double)kAmeJITWaitTimeout);
+                if (!ame139_requestJIT(NO)) {
+                    // ★ [JIT-WAIT] 没能调起使能工具(未安装 / 无法打开):requestJIT 已弹出
+                    //   「未检测到 JIT 使能工具」+ 按 debug.jit_enabler 的安装提示,直接优雅
+                    //   放弃,不再白等 30 秒。
+                    NSLog(@"[JIT-WAIT] no JIT enabler was launched -- aborting without waiting");
+                    [PLLogOutputView handleExitCode:1];
+                    return 1;
+                }
+                ameWaitedForJIT = YES;
+                // ③ 轮询「活的调试器是否在岗」(JIT26IsLikelyDebuggerKeepAttached 比单看
+                //    粘滞的 CS_DEBUGGED 准):有界 30s,ame169 自带超时与周期日志。
+                ameJitBecameReady = ame169_waitForJITCondition(^BOOL{
+                    return JIT26IsLikelyDebuggerKeepAttached();
+                }, kAmeJITWaitTimeout, @"launchJVM-jit26");
+                // 就绪(或超时)后都重试一次;成功则继续原有启动流程。
+                result = JIT26CreateRegionLegacySafe(getpagesize());   // ★ 重试一次(写回 static 缓存)
+                NSLog(@"[JIT-WAIT] retry after wait -> %p (becameReady=%d waited=%d)",
+                      result, ameJitBecameReady, ameWaitedForJIT);
+            }
+
+            // ④ ★ [JIT-WAIT] 超时未就绪 或 就绪了但建区仍失败 ⇒ 才弹框放弃(文案区分两种情况)。
+            if (result == NULL) {
+                NSLog(@"[JIT-WAIT] still NULL after request/wait/retry -- aborting launch gracefully (becameReady=%d)",
+                      ameJitBecameReady);
+                if (ameWaitedForJIT && !ameJitBecameReady) {
+                    // 超时未就绪:明确「已调起、30s 内未就绪」,并列出可能的方式(不只点名 StikDebug)。
+                    showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.timeout.message", nil));
+                } else {
+                    // 就绪了但建区仍失败:保留原有关于 UniversalJIT26 / brk 的解释。
+                    showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.blocked.message", nil));
+                }
+                [PLLogOutputView handleExitCode:1];
+                return 1;
+            }
         }
         if ((uint32_t)result != 0x690000E0) {
             munmap(result, getpagesize());
@@ -2165,11 +2251,60 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 // 逐个执行 processor 的（ForgeProcessorRunner 复刻该行为）。
 //
 // 注意：调用后进程内 JVM 已创建，游戏启动必须重启 app（见 gJvmUsedInProcess）。
-// Task 139（参照 Air 移植）：按 debug.jit_enabler 偏好打开 JIT 申请 URL 并弹
-// 等待框。forceStikJIT=YES 时忽略偏好、固定走 stikjit:// 带脚本再附（TXM
-// 再附路径）。openURL 与弹框必须在主线程：headless 通常在后台队列，
-// 加守卫防主线程误调时 dispatch_sync 死锁。
-static void ame139_requestJIT(BOOL forceStikJIT) {
+// ★ [JIT-WAIT] 依 debug.jit_enabler 选择「等待 JIT 就绪」提示文案的 i18n 键。
+//   与顶部前置声明成对;C 风格文件「先声明后使用」。
+static NSString *ameJITWaitMessageKeyForEnabler(NSString *enabler) {
+    if ([enabler isEqualToString:@"manual"]) return @"jit.wait.manual";
+    if ([enabler isEqualToString:@"trollstore"]) return @"jit.wait.trollstore";
+    if ([enabler isEqualToString:@"sidestore"]) return @"jit.wait.sidestore";
+    if ([enabler isEqualToString:@"jitstreamer"]) return @"jit.wait.jitstreamer";
+    if ([enabler isEqualToString:@"stosdebug"]) return @"jit.wait.stosdebug";
+    if ([enabler isEqualToString:@"stikdebug"] || [enabler isEqualToString:@"stikjit"]) return @"jit.wait.stikdebug";
+    return @"jit.wait.auto";
+}
+
+// ★ [JIT-WAIT] 依 debug.jit_enabler 选择「未检测到 JIT 使能工具」提示里的工具名;
+//   返回 nil 表示用通用文案(列出所有可能的方式)。
+static NSString *ameJITEnablerDisplayName(NSString *enabler) {
+    if ([enabler isEqualToString:@"trollstore"]) return @"TrollStore";
+    if ([enabler isEqualToString:@"stikdebug"] || [enabler isEqualToString:@"stikjit"]) return @"StikDebug";
+    if ([enabler isEqualToString:@"sidestore"]) return @"SideStore (SideJIT)";
+    if ([enabler isEqualToString:@"jitstreamer"]) return @"JitStreamer";
+    if ([enabler isEqualToString:@"stosdebug"]) return @"StosDebug";
+    return nil;
+}
+
+// ★ [JIT-WAIT] 该 URL scheme 是否已登记在 Info.plist 的 LSApplicationQueriesSchemes 里。
+//   canOpenURL 只对登过的 scheme 可信:没登的 scheme 即使用户装了工具也会返回 NO,
+//   所以预检只对白名单内做(与 Info.plist 现有条目一致)。
+static BOOL ameJITSchemeCanBeProbed(NSString *scheme) {
+    static NSArray<NSString *> *probeable = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        probeable = @[@"stikjit", @"stikdebug", @"sidestore", @"stosdebug"];
+    });
+    return scheme != nil && [probeable containsObject:scheme];
+}
+
+// Task 139（参照 Air 移植）：按 debug.jit_enabler 偏好打开 JIT 申请 URL 并弹等待框。
+// forceStikJIT=YES 时忽略偏好、固定走 stikjit:// 带脚本再附（TXM 再附路径）。
+// openURL 与弹框必须在主线程：headless 通常在后台队列，加守卫防主线程误调时 dispatch_sync 死锁。
+//
+// ★ [JIT-WAIT] 返回值(新增):YES = 调用方应进入「等待 JIT 就绪」(工具确实被调起,或 manual
+//   方式本就要用户手动开启);NO = 没能调起(未安装 / 无法打开 / 没选到 URL)—— 调用方应
+//   直接优雅放弃,不要再白等一个超时窗口。
+// ★ [JIT-WAIT] 修复的缺陷:原先 openURL 用 completionHandler:nil,未安装任何 JIT 工具时
+//   iOS 静默失败,启动器却【无条件】弹「正在等待」⇒ 用户白等一整个超时窗口才被告知失败。
+//   现在:① canOpenURL 可选预检(白名单内);② openURL 带 completionHandler 拿 success 这个
+//   事实;③ 等待框只在确实调起(或 manual)时显示;④ 调起失败立刻弹「未检测到 JIT 使能工具」
+//   + 按当前 debug.jit_enabler 给对应安装项,并让调用方跳过等待。
+static BOOL ame139_requestJIT(BOOL forceStikJIT) {
+    __block NSString *chosenEnabler = nil;
+    __block BOOL hasURL = NO;         // 选中了非空 URL
+    __block BOOL precheckFailed = NO; // canOpenURL 明确说打不开(工具没装)
+    __block BOOL urlOpened = NO;      // openURL completionHandler 的 success
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
     dispatch_block_t work = ^{
         NSString *enabler = nil;
         if (forceStikJIT) {
@@ -2180,6 +2315,7 @@ static void ame139_requestJIT(BOOL forceStikJIT) {
                 enabler = @"auto";
             }
         }
+        chosenEnabler = enabler;
         BOOL noScript = getPrefBool(@"debug.jit26_script_disable");
         NSString *bundleId = NSBundle.mainBundle.bundleIdentifier;
         NSLog(@"[JIT] [Headless] Task139 enabler=%@ noScript=%d forceStikJIT=%d",
@@ -2240,16 +2376,85 @@ static void ame139_requestJIT(BOOL forceStikJIT) {
             url = [NSURL URLWithString:[NSString stringWithFormat:
                 @"sidestore://sidejit-enable?pid=%d", getpid()]];
         }
-        if (url) {
-            [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
+        if (url != nil) {
+            hasURL = YES;
+            // ★ [JIT-WAIT] 可选预检:scheme 已登记时先 canOpenURL,探不到 ⇒ 工具没装;
+            //   直接给安装提示,比等 completion 更快也更明确。
+            if (ameJITSchemeCanBeProbed(url.scheme) &&
+                ![UIApplication.sharedApplication canOpenURL:url]) {
+                precheckFailed = YES;
+                NSLog(@"[JIT-WAIT] canOpenURL(%@) == NO -- JIT enabler app not installed", url.scheme);
+                dispatch_semaphore_signal(sem);
+                return;
+            }
+            // ★ [JIT-WAIT] 原为 completionHandler:nil(未装工具时静默失败);改为拿 success 这个事实。
+            [UIApplication.sharedApplication openURL:url options:@{}
+                completionHandler:^(BOOL success) {
+                    urlOpened = success;
+                    NSLog(@"[JIT-WAIT] openURL scheme=%@ -> success=%d", url.scheme, success);
+                    dispatch_semaphore_signal(sem);
+                }];
+        } else {
+            dispatch_semaphore_signal(sem);
         }
-        showDialog(localize(@"i18n_str_437", nil), localize(@"i18n_str_439", nil));
     };
-    if ([NSThread isMainThread]) {
+
+    BOOL onMain = [NSThread isMainThread];
+    BOOL gotReply = NO;
+    if (onMain) {
+        // ★ [JIT-WAIT] 主线程上不能阻塞等 completionHandler(handler 也走主队列 ⇒ 死锁):
+        //   内联执行 work,completion 只留日志;launched 的判定退回 canOpenURL 事实。
         work();
     } else {
+        // headless 通常在后台队列;openURL 与弹框必须在主线程 ⇒ 与旧行为一致地 dispatch_sync。
         dispatch_sync(dispatch_get_main_queue(), work);
+        long wr = dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)));
+        gotReply = (wr == 0);
+        if (!gotReply) {
+            NSLog(@"[JIT-WAIT] openURL completion not received within 3s -- assuming the tool was launched");
+        }
     }
+
+    BOOL isManual = [chosenEnabler isEqualToString:@"manual"];
+    BOOL launched = NO;   // 事实:使能工具确实被系统接管
+    if (isManual) {
+        launched = NO;                 // manual 单列(下面直接进等待)
+    } else if (precheckFailed) {
+        launched = NO;
+    } else if (!hasURL) {
+        launched = NO;
+    } else if (onMain) {
+        launched = YES;                // 主线程拿不到 success ⇒ 保守按已调起
+    } else if (!gotReply) {
+        launched = YES;                // 回执超时 ⇒ 保守按已调起
+    } else {
+        launched = urlOpened;
+    }
+
+    if (isManual) {
+        // ★ [JIT-WAIT] manual / 该方式本就不跳转:仍要等(用户可能在别处手动开),
+        //   等待框明确「请现在到你的 JIT 工具里为本 App 启用 JIT,最长等 30 秒」。
+        NSLog(@"[JIT-WAIT] enabler=manual -- waiting for the user to enable JIT elsewhere");
+        showDialog(localize(@"i18n_str_437", nil), localize(@"jit.wait.manual", nil));
+        return YES;
+    }
+    if (launched) {
+        // ★ 等待框只在确实调起时显示;文案按 debug.jit_enabler 给对应那条,并列出可能的方式。
+        showDialog(localize(@"i18n_str_437", nil),
+                   localize(ameJITWaitMessageKeyForEnabler(chosenEnabler), nil));
+        return YES;
+    }
+    // ★ [JIT-WAIT] 没调起:明确「未检测到 JIT 使能工具」,并按当前 debug.jit_enabler 给安装项,
+    //   而不是弹「正在等待」让用户白等。
+    NSString *toolName = ameJITEnablerDisplayName(chosenEnabler);
+    if (toolName.length > 0) {
+        showDialog(localize(@"jit.wait.abort.title", nil),
+                   [NSString stringWithFormat:localize(@"jit.wait.missing.tool", nil), toolName]);
+    } else {
+        showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.missing.generic", nil));
+    }
+    return NO;
 }
 
 int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJavaVersion) {
@@ -2275,7 +2480,12 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
             NSLog(@"[JavaLauncher] launchHeadlessJVM: debug_skip_wait_jit set, proceeding without JIT");
         } else {
             NSLog(@"[JavaLauncher] launchHeadlessJVM: Task139 JIT not enabled -- auto-requesting via configured enabler");
-            ame139_requestJIT(NO);
+            if (!ame139_requestJIT(NO)) {
+                // ★ [JIT-WAIT] 没能调起使能工具(未安装/无法打开):requestJIT 已弹出安装提示,
+                //   直接明确报错,不再空等 120 秒。
+                NSLog(@"[JavaLauncher] launchHeadlessJVM: no JIT enabler launched -- aborting without waiting");
+                return -1;
+            }
             // 有界等待 120s（ame169：心跳+挂起豁免）；超时则明确报错而非无限转圈。
             if (!ame169_waitForJITCondition(^BOOL{ return isJITEnabled(NO); }, 120.0, @"Headless JIT")) {
                 NSLog(@"[JavaLauncher] launchHeadlessJVM: Task139 JIT wait timed out");
