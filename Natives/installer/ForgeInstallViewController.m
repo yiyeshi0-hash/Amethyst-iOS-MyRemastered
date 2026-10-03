@@ -476,6 +476,43 @@ NSString * const ForgeInstallerFlowErrorDomain = @"ForgeInstallerFlowErrorDomain
                 });
             };
 
+            // ★ [FORGE-RETRY] 同步拉取 + 退避重试。
+            //   起因(用户实测):下 Forge 时常报"无法获取 Forge 版本列表",要重开好几次才成。
+            //   根因:快路径与回退源原本**各只尝试 1 次**,而 BMCLAPI 会偶发 429/5xx,
+            //   国际线路也会瞬时抖动 ⇒ 一次失败就弹框关页。这里统一加"最多 N 次 + 线性退避",
+            //   并把 HTTP 非 2xx 也判为失败(原先只要拿到 body 就当成功)。
+            NSData *(^ameFetchWithRetry)(NSString *, NSInteger) = ^NSData *(NSString *urlString, NSInteger maxAttempts) {
+                if (maxAttempts < 1) { maxAttempts = 1; }
+                NSData *result = nil;
+                for (NSInteger attempt = 1; attempt <= maxAttempts; attempt++) {
+                    dispatch_semaphore_t s = dispatch_semaphore_create(0);
+                    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+                    req.timeoutInterval = 20.0;
+                    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+                    [req setValue:userAgent forHTTPHeaderField:@"User-Agent"];
+                    __block NSData *d = nil;
+                    __block NSInteger status = 0;
+                    NSURLSessionDataTask *t = [[NSURLSession sharedSession] dataTaskWithRequest:req
+                        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                            d = data;
+                            if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+                                status = ((NSHTTPURLResponse *)response).statusCode;
+                            }
+                            dispatch_semaphore_signal(s);
+                        }];
+                    [t resume];
+                    dispatch_semaphore_wait(s, dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC));
+                    BOOL httpOK = (status == 0 || (status >= 200 && status < 300));
+                    if (d.length > 0 && httpOK) { result = d; break; }
+                    NSLog(@"[Forge] fetch attempt %ld/%ld failed (http=%ld, bytes=%lu) %@",
+                          (long)attempt, (long)maxAttempts, (long)status, (unsigned long)d.length, urlString);
+                    if (attempt < maxAttempts) {
+                        [NSThread sleepForTimeInterval:1.2 * (double)attempt];
+                    }
+                }
+                return result;
+            };
+
             // ========== 快速路径：BMCLAPI 按版本 JSON 接口 ==========
             // 接口：https://bmclapi2.bangbang93.com/forge/minecraft/<mcVersion>
             // 返回：[{ "version": "47.2.0", "branch": null, "modified": "...", "files": [...] }, ...]
@@ -485,21 +522,10 @@ NSString * const ForgeInstallerFlowErrorDomain = @"ForgeInstallerFlowErrorDomain
                 NSString *encodedMC = [mcVersion stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
                 NSString *bmclJSONURL = [NSString stringWithFormat:@"https://bmclapi2.bangbang93.com/forge/minecraft/%@", encodedMC];
 
-                __block NSData *jsonData = nil;
-                __block NSError *jsonError = nil;
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                NSMutableURLRequest *jsonReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:bmclJSONURL]];
-                jsonReq.timeoutInterval = 20.0;
-                [jsonReq setValue:userAgent forHTTPHeaderField:@"User-Agent"];
-                NSURLSessionDataTask *jsonTask = [[NSURLSession sharedSession] dataTaskWithRequest:jsonReq completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                    jsonData = data;
-                    jsonError = error;
-                    dispatch_semaphore_signal(sem);
-                }];
-                [jsonTask resume];
-                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC));
+                // ★ [FORGE-RETRY] 快路径最多 3 次(带退避):BMCLAPI 偶发 429/5xx 时不再直接放弃
+                NSData *jsonData = ameFetchWithRetry(bmclJSONURL, 3);
 
-                if (jsonData && !jsonError) {
+                if (jsonData) {
                     NSArray *tokens = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
                     if ([tokens isKindOfClass:[NSArray class]] && tokens.count > 0) {
                         NSMutableArray *collected = [NSMutableArray new];
@@ -526,9 +552,8 @@ NSString * const ForgeInstallerFlowErrorDomain = @"ForgeInstallerFlowErrorDomain
                         }
                     }
                 }
-                NSLog(@"[Forge] Fast path failed (data=%@ error=%@), falling back to full maven-metadata.xml",
-                      jsonData ? [NSString stringWithFormat:@"%luB", (unsigned long)jsonData.length] : @"nil",
-                      jsonError.localizedDescription ?: @"nil");
+                NSLog(@"[Forge] Fast path failed after retries (data=%@), falling back to full maven-metadata.xml",
+                      jsonData ? [NSString stringWithFormat:@"%luB", (unsigned long)jsonData.length] : @"nil");
             }
 
             // ========== fallback：全量 maven-metadata.xml（主源优先 + 串行回退）==========
@@ -549,20 +574,9 @@ NSString * const ForgeInstallerFlowErrorDomain = @"ForgeInstallerFlowErrorDomain
                 return YES;
             };
 
-            // 同步拉取单个源（带超时），返回 data 或 nil
+            // ★ [FORGE-RETRY] 同步拉取单个源(带超时 + 退避重试 2 次),返回 data 或 nil
             NSData *(^fetchSource)(NSString *) = ^NSData *(NSString *urlString) {
-                __block NSData *result = nil;
-                dispatch_semaphore_t s = dispatch_semaphore_create(0);
-                NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-                req.timeoutInterval = 30.0;
-                [req setValue:userAgent forHTTPHeaderField:@"User-Agent"];
-                NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                    if (data && !error) result = data;
-                    dispatch_semaphore_signal(s);
-                }];
-                [task resume];
-                dispatch_semaphore_wait(s, dispatch_time(DISPATCH_TIME_NOW, 35 * NSEC_PER_SEC));
-                return result;
+                return ameFetchWithRetry(urlString, 2);
             };
 
             // 解析指定数据并收集匹配 gameVersion 的 Forge 版本
