@@ -1971,6 +1971,7 @@
 // Task 134: JIT enabler picker (ported from Air)
 "preference.debug.jit_enabler.auto" = "Auto (recommended)";
 "preference.debug.jit_enabler.stikjit" = "StikDebug / StikJIT";
+"preference.debug.jit_enabler.stikdebug" = "StikDebug (stikdebug://)";
 "preference.debug.jit_enabler.sidestore" = "SideStore";
 "preference.debug.jit_enabler.stosdebug" = "StosDebug";
 "preference.debug.jit_enabler.jitstreamer" = "JitStreamer-EB";

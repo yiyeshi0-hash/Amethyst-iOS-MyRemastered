@@ -1168,6 +1168,10 @@
                 @"pickKeys": @[
                     @"auto",
                     @"stikjit",
+                    // ★ [POCKETJ-JIT] 新增:只注册 stikdebug:// 的 StikDebug 版本
+                    //   (PocketJ INTEGRATION.md 的 StikDebug 形式,带 script-name)。
+                    //   pickKeys / pickList 必须一一对应,勿只改一边。
+                    @"stikdebug",
                     @"sidestore",
                     @"stosdebug",
                     @"jitstreamer",
@@ -1177,6 +1181,7 @@
                 @"pickList": @[
                     localize(@"preference.debug.jit_enabler.auto", nil),
                     localize(@"preference.debug.jit_enabler.stikjit", nil),
+                    localize(@"preference.debug.jit_enabler.stikdebug", nil),
                     localize(@"preference.debug.jit_enabler.sidestore", nil),
                     localize(@"preference.debug.jit_enabler.stosdebug", nil),
                     localize(@"preference.debug.jit_enabler.jitstreamer", nil),

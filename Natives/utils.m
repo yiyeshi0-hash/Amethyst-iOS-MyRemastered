@@ -185,6 +185,24 @@ void* JIT26CreateRegionLegacy(size_t len) {
     asm("brk #0x69 \n"
         "ret");
 }
+// ★ [POCKETJ-JIT] Universal JIT 协议第 0 号调用:显式请求调试器脱离。
+//   参考:EricoEC/PocketJLauncher · Vendor/StikJIT/Resources/universal.js(commands[0])
+//   与 Vendor/StikJIT/INTEGRATION.md「Implement the universal protocol」给出的签名:
+//     void JIT26Detach(void) { mov x16, #0; brk #0xf00d; ret }
+//   x16=0 ⇒ universal.js 的 JIT26Detach() ⇒ 向 debugserver 发 "D" 并结束脚本循环。
+//   ⚠ 调用时机(INTEGRATION.md 强制):必须先对【所有】初始 RX 区完成
+//     JIT26PrepareRegion、建好可写别名,再调本函数;脚本一旦脱离,后加入的 RX 区
+//     就无法再被服务。本仓库现有启动流程靠 universal.js 的 detachAfterFirstBr
+//     在 dyld 补丁阶段的 JIT26PrepareRegion / JIT26PrepareRegionForPatching 之后
+//     隐式脱离,故这里只补齐协议原语,不在启动路径上另加调用点 —— 擅自提前脱离会让
+//     dyld_bypass_validation.m 里未包安全网的 brk 直接 SIGTRAP 崩溃。详见
+//     Natives/pocketj_jit/PORTING_NOTES.md。
+__attribute__((noinline,optnone,naked))
+void JIT26Detach(void) {
+    asm("mov x16, #0 \n"
+        "brk #0xf00d \n"
+        "ret");
+}
 __attribute__((noinline,optnone,naked))
 void* JIT26PrepareRegion(void *addr, size_t len) {
     asm("mov x16, #1 \n"
@@ -250,6 +268,93 @@ void* JIT26CreateRegionLegacySafe(size_t len) {
     }
     sigaction(SIGTRAP, &oldsa, NULL);
     return result;
+}
+
+// ★ [POCKETJ-JIT] JIT26Detach 的 SIGTRAP 安全网版:与 JIT26CreateRegionLegacySafe
+//   同款。调试器已脱离时 brk #0xf00d 无人应答,捕获后直接返回,不使进程致死;
+//   调试器在岗时 brk 由调试器例外端口服务,本处理器不触发,行为与裸函数一致。
+void JIT26DetachSafe(void) {
+    struct sigaction sa, oldsa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = JIT26TrapCatch;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NODEFER;
+    sigaction(SIGTRAP, &sa, &oldsa);
+
+    if (sigsetjmp(g_jit26TrapEnv, 1) == 0) {
+        g_jit26TrapArmed = 1;
+        JIT26Detach();
+        g_jit26TrapArmed = 0;
+    }
+    sigaction(SIGTRAP, &oldsa, NULL);
+}
+
+// ============================================================================
+// ★ [POCKETJ-JIT] PocketJ 内置 JIT 前置门禁
+//   (EricoEC/PocketJLauncher · Vendor/StikJIT/INTEGRATION.md
+//    「Built-in StikJIT: Gate every entry point」)
+//
+//   内置 StikJIT 需要同时满足:iOS ≥ 17.4 · 宿主进程 get-task-allow ·
+//   可读配对文件。注意 get-task-allow 属于宿主进程,必须在宿主侧检查。
+//
+//   ⚠ 本仓库暂未接入 Helper 扩展(进程不能自附加调试器 —— 见 PocketJ
+//     Natives/stikdebug/StikDebugEngine.m 顶部同款注释),因此这里【只检测、
+//     只记日志/供 UI 展示】,不做任何 vAttach 动作。等 Helper 扩展落地后,
+//     这三个门禁就是启动 Helper 前的 guard。
+// ============================================================================
+
+BOOL AMEJITDeviceSupportsBuiltInStikJIT(void) {
+    if (@available(iOS 17.4, *)) {
+        return YES;
+    }
+    return NO;
+}
+
+// 宿主进程是否带 get-task-allow。使用 Security 框架 SPI(SecTask*),
+// 原型见本文件顶部的 extern 声明;与 INTEGRATION.md 的 ObjC 示例同构,
+// 但按文档写法释放正确(不复用本文件既有 getEntitlementValue —— 它有一处
+// 释放后使用)。
+BOOL AMEJITHasGetTaskAllow(void) {
+    void *task = SecTaskCreateFromSelf(NULL);
+    if (task == NULL) {
+        return NO;
+    }
+    CFTypeRef value = SecTaskCopyValueForEntitlement(task, @"get-task-allow", NULL);
+    BOOL result = (value == kCFBooleanTrue);
+    if (value != NULL) {
+        CFRelease(value);
+    }
+    CFRelease(task);
+    return result;
+}
+
+// 配对文件推荐位置(INTEGRATION.md「Store and import the pairing file」):
+//   Documents/StikJIT/pairingFile.plist
+// Info.plist 已置 UIFileSharingEnabled=true,用户可经 Finder/AFC 拷入。
+NSString *AMEJITPairingFilePath(void) {
+    NSURL *documents = [NSFileManager.defaultManager
+        URLForDirectory:NSDocumentDirectory inDomain:NSUserDomainMask
+       appropriateForURL:nil create:YES error:nil];
+    if (!documents) {
+        return nil;
+    }
+    NSURL *dir = [documents URLByAppendingPathComponent:@"StikJIT" isDirectory:YES];
+    return [[dir URLByAppendingPathComponent:@"pairingFile.plist"] path];
+}
+
+BOOL AMEJITHasPairingFile(void) {
+    NSString *path = AMEJITPairingFilePath();
+    return path.length > 0 && [NSFileManager.defaultManager fileExistsAtPath:path];
+}
+
+// 在一次 JIT 获取动作前把门禁状态打到日志(只读,无副作用)。
+void AMEJITLogPocketJReadiness(NSString *context) {
+    NSLog(@"[JIT] [POCKETJ-JIT] readiness(%@): ios17_4=%@ get-task-allow=%@ pairing=%@ path=%@",
+          context ?: @"?",
+          AMEJITDeviceSupportsBuiltInStikJIT() ? @"YES" : @"NO",
+          AMEJITHasGetTaskAllow() ? @"YES" : @"NO",
+          AMEJITHasPairingFile() ? @"YES" : @"NO",
+          AMEJITPairingFilePath() ?: @"(nil)");
 }
 
 #ifndef P_TRACED

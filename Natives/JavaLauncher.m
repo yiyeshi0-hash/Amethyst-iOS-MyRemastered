@@ -2184,6 +2184,11 @@ static void ame139_requestJIT(BOOL forceStikJIT) {
         NSString *bundleId = NSBundle.mainBundle.bundleIdentifier;
         NSLog(@"[JIT] [Headless] Task139 enabler=%@ noScript=%d forceStikJIT=%d",
               enabler, noScript, forceStikJIT);
+        // ★ [POCKETJ-JIT] 前置门禁(INTEGRATION.md「Gate every entry point」):
+        //   在启动任何 JIT 获取方式前,记录宿主 get-task-allow / iOS 版本 /
+        //   配对文件状态。只记日志,不改既有流程(内置 StikJIT Helper 扩展尚未
+        //   接入,见 Natives/pocketj_jit/PORTING_NOTES.md)。
+        AMEJITLogPocketJReadiness(@"headless-requestJIT");
         NSURL *url = nil;
         if ([enabler isEqualToString:@"trollstore"]) {
             url = [NSURL URLWithString:[NSString stringWithFormat:
@@ -2206,6 +2211,17 @@ static void ame139_requestJIT(BOOL forceStikJIT) {
         } else if ([enabler isEqualToString:@"jitstreamer"]) {
             url = [NSURL URLWithString:[NSString stringWithFormat:
                 @"http://[fd00::]:9172/launch_app/%@", bundleId]];
+        } else if ([enabler isEqualToString:@"stikdebug"]) {
+            // ★ [POCKETJ-JIT] PocketJ(INTEGRATION.md「Configure the JIT methods ·
+            //   StikDebug」)的 URL 形式:
+            //     stikdebug://enable-jit?bundle-id=..&pid=..&script-name=<name>
+            //   与下面的 stikjit:// 的区别:用 script-name 指定脚本文件名
+            //   (开发者选定、不给用户配),不再内联 base64 script-data。
+            //   适配只注册 stikdebug:// 的 StikDebug 版本。脚本名 universal.js
+            //   即本包内 UniversalJIT26.js(同一份 PocketJ/StikJIT universal.js)。
+            url = [NSURL URLWithString:[NSString stringWithFormat:
+                @"stikdebug://enable-jit?bundle-id=%@&pid=%d&script-name=universal.js",
+                bundleId, getpid()]];
         } else if ([enabler isEqualToString:@"manual"]) {
             // 手动模式：不跳转，仅弹窗告知（维持旧语义）。
         } else if (@available(iOS 17.4, *)) {

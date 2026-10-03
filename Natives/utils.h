@@ -155,6 +155,22 @@ BOOL ame169_waitForJITCondition(BOOL (^condition)(void), NSTimeInterval timeout,
 void ame185_dispatchToMainSelfHealing(dispatch_block_t block, NSString *label);
 // used for large memory regions
 void* JIT26PrepareRegion(void *addr, size_t len);
+// ★ [POCKETJ-JIT] Universal JIT 协议第 0 号调用:请求调试器脱离
+//   (mov x16,#0; brk #0xf00d)。与 JIT26PrepareRegion 同族,是 PocketJ/StikJIT
+//   universal.js 的 commands[0]。⚠ 只能在【所有】初始 RX 区都已 PrepareRegion
+//   之后调用(见 utils.m 内注释与 Natives/pocketj_jit/PORTING_NOTES.md)。
+void JIT26Detach(void);
+// JIT26Detach 的 SIGTRAP 安全网版:调试器已脱离时 brk #0xf00d 无人应答,
+// 捕获后直接返回,不使进程致死(与 JIT26CreateRegionLegacySafe 同款)。
+void JIT26DetachSafe(void);
+// ★ [POCKETJ-JIT] PocketJ 内置 StikJIT 的前置门禁(INTEGRATION.md「Gate every
+//   entry point」):iOS ≥17.4 + 宿主 get-task-allow + 可读配对文件。
+//   本仓库暂未接入 Helper 扩展,以下仅用于检测/日志/UI 提示,不做自附加调试器。
+BOOL AMEJITDeviceSupportsBuiltInStikJIT(void);
+BOOL AMEJITHasGetTaskAllow(void);
+NSString *AMEJITPairingFilePath(void);   // Documents/StikJIT/pairingFile.plist
+BOOL AMEJITHasPairingFile(void);
+void AMEJITLogPocketJReadiness(NSString *context);
 // same as JIT26PrepareRegion, but used for smaller memory regions
 // and retain content instead of filling 0x69
 void JIT26PrepareRegionForPatching(void *addr, size_t len);
