@@ -701,8 +701,10 @@ static const void *kE1InstanceNameKey = &kE1InstanceNameKey;
     pContentTop.identifier = @"portrait-top";
     NSLayoutConstraint *pContentLead  = [self.contentCard.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:kE1MarginPortrait];
     NSLayoutConstraint *pContentTrail = [self.contentCard.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-kE1MarginPortrait];
-    NSLayoutConstraint *pSideBottom   = [NSLayoutConstraint constraintWithItem:self.sidebarCard attribute:NSLayoutAttributeNotAnAttribute relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:0];
-    (void)pSideBottom;
+    // ★ [IPAD15-CRASH] 删掉一行死约束:它用 NSLayoutAttributeNotAnAttribute 当【第一个 item 的属性】
+    //   且 toItem:nil,建完立刻 (void) 丢弃、从未参与布局。iPadOS 15.4.1 上 CoreAutoLayout 会抛
+    //   "NSLayoutConstraint ... : Unknown layout attribute" ⇒ LauncherCardLayoutViewController
+    //   的 viewDidLoad 直接崩(iPad 走这个 VC,iPhone 走 LauncherRootViewController ⇒ 只在 iPad 复现)。
     for (NSLayoutConstraint *c in @[pContentTop, pContentLead, pContentTrail,
                                     pSideLead, pSideTrail, pSideTop, pSideHeight,
                                     pRightTop, pRightTrail, pRightHeight, pRightWidth]) {
