@@ -179,8 +179,9 @@
 		<string>audio</string>
 		<string>fetch</string>
 	</array>
-	<key>UIDesignRequiresCompatibility</key>
-	<true/>
+	<!-- ★ [GLASSUI] 2026-10-03 移除此键:UIDesignRequiresCompatibility = true 会让 App 退回
+	     iOS 26 之前的外观,等于主动放弃系统液态玻璃。上游 5.1.0 置 true,fork 版里没有此键;
+	     两侧对比已确认:去掉才出玻璃。 -->
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>
